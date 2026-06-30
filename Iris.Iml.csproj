@@ -57,5 +57,17 @@
 			<HintPath>..\..\lib\v2.9.8\UnityEngine.ImageConversionModule.dll</HintPath>
 			<Private>false</Private>
 		</Reference>
+		<Reference Include="UnityEngine.UIModule">
+			<HintPath>..\..\lib\v2.9.8\UnityEngine.UIModule.dll</HintPath>
+			<Private>false</Private>
+		</Reference>
+		<Reference Include="UnityEngine.UI">
+			<HintPath>..\..\lib\v2.9.8\UnityEngine.UI.dll</HintPath>
+			<Private>false</Private>
+		</Reference>
+		<Reference Include="UnityEngine.TextRenderingModule">
+			<HintPath>..\..\lib\v2.9.8\UnityEngine.TextRenderingModule.dll</HintPath>
+			<Private>false</Private>
+		</Reference>
 	</ItemGroup>
 </Project>

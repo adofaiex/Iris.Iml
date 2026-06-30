@@ -10,7 +10,7 @@ namespace Iris.Iml
     /// <summary>
     /// IML渲染器主类
     /// </summary>
-    public class IrisRenderer
+    public class IrisGuiRenderer : IImlRenderer
     {
         private readonly ImlParser _parser = new();
         private ImlDocument _document;
@@ -231,11 +231,22 @@ namespace Iris.Iml
 
             foreach (var child in element.Children)
             {
-                if (child is ImlElement setter && setter.TagName == "Setter")
+                if (child is ImlElement childElement)
                 {
-                    var property = setter.GetString("property");
-                    var value = setter.GetString("value");
-                    style.Setters[property] = value;
+                    if (childElement.TagName == "Setter")
+                    {
+                        var property = childElement.GetString("property");
+                        var value = childElement.GetString("value");
+                        if (!string.IsNullOrEmpty(property))
+                            style.Setters[property] = value ?? "";
+                    }
+                    else
+                    {
+                        // Custom property tag: <tagName value="..." />
+                        var value = childElement.GetString("value");
+                        if (!string.IsNullOrEmpty(value))
+                            style.Setters[childElement.TagName] = value;
+                    }
                 }
             }
 
@@ -267,8 +278,6 @@ namespace Iris.Iml
             }
 
             sw.Stop();
-            if (_elementCount > 0)
-                Log($"[IrisRenderer] Rendered {_elementCount} elements in {sw.ElapsedMilliseconds}ms");
 
             if (_effectsScheduled)
             {
@@ -360,6 +369,13 @@ namespace Iris.Iml
                     RenderTextArea(element);
                     break;
 
+                case "Fill":
+                    if (_layout != null)
+                        _layout.Fill();
+                    else
+                        GUILayout.FlexibleSpace();
+                    break;
+
                 case "Icon":
                     RenderIcon(element);
                     break;
@@ -416,6 +432,7 @@ namespace Iris.Iml
         {
             bool isHorizontal = element.TagName == "HBox";
             var containerStyle = GetContainerStyle(element);
+            var style = GetEffectiveStyle(element);
 
             var gapStr = element.GetString("gap");
             int gap = 0;
@@ -423,6 +440,7 @@ namespace Iris.Iml
                 gap = g;
 
             var options = new List<GUILayoutOption>();
+            options.AddRange(GetStyleOptions(style));
             options.Add(GUILayout.ExpandWidth(true));
             if (!isHorizontal)
                 options.Add(GUILayout.ExpandHeight(true));
@@ -479,7 +497,6 @@ namespace Iris.Iml
 
         private void RenderScrollView(ImlElement element)
         {
-            var style = GetEffectiveStyle(element);
             var scrollPositionKey = element.GetString("scrollPosition") ?? "_scrollPos";
 
             if (!_loopItemContext.TryGetValue(scrollPositionKey, out var posObj))
@@ -489,7 +506,14 @@ namespace Iris.Iml
             }
 
             Vector2 scrollPos = (Vector2)posObj;
-            scrollPos = GUILayout.BeginScrollView(scrollPos, GetStyleOptions(style));
+            var heightStr = element.GetString("height");
+            int height = 0;
+            var options = new List<GUILayoutOption>();
+            options.Add(GUILayout.ExpandWidth(true));
+            options.Add(GUILayout.ExpandHeight(true));
+            if (!string.IsNullOrEmpty(heightStr) && int.TryParse(heightStr, out height))
+                options.Add(GUILayout.Height(height));
+            scrollPos = GUILayout.BeginScrollView(scrollPos, options.ToArray());
 
             try
             {
@@ -567,18 +591,25 @@ namespace Iris.Iml
         private void RenderText(ImlElement element)
         {
             var text = ResolveAttributeValue(element, "text");
+            var useAttr = element.GetString("use");
+            var richTextAttr = element.GetString("richText");
+            bool richText = richTextAttr == "true";
+
             if (_layout != null)
             {
+                // use/richText are for GameObject target; GUILayout ignores use, richText is handled by GUIStyle
                 _layout.Text(text, GetTextStyle(element));
             }
             else
             {
                 var style = GetEffectiveStyle(element);
+                var guiStyle = new GUIStyle(GUI.skin.label);
+                guiStyle.richText = richText;
                 var prevBg = GUI.backgroundColor;
                 var prevContent = GUI.contentColor;
                 GUI.backgroundColor = Color.white;
                 GUI.contentColor = GetColor(style.Setters.TryGetValue("color", out var colorVal) ? colorVal : "#FFFFFF");
-                try { GUILayout.Label(text, GetStyleOptions(style)); }
+                try { GUILayout.Label(text, guiStyle, GetStyleOptions(style)); }
                 finally { GUI.contentColor = prevContent; GUI.backgroundColor = prevBg; }
             }
         }
@@ -681,32 +712,7 @@ namespace Iris.Iml
                 if (!string.IsNullOrEmpty(command))
                     InvokeCommand(command);
 
-                var onClick = ResolveAttributeValue(element, "on-click");
-                if (!string.IsNullOrEmpty(onClick))
-                {
-                    string handlerName = onClick;
-                    string stringArg = null;
-                    var parenIdx = onClick.IndexOf('(');
-                    if (parenIdx > 0 && onClick.EndsWith(")"))
-                    {
-                        handlerName = onClick.Substring(0, parenIdx).Trim();
-                        var argStr = onClick.Substring(parenIdx + 1, onClick.Length - parenIdx - 2).Trim();
-                        if ((argStr.StartsWith("'") && argStr.EndsWith("'")) ||
-                            (argStr.StartsWith("\"") && argStr.EndsWith("\"")))
-                        {
-                            stringArg = argStr.Substring(1, argStr.Length - 2);
-                        }
-                        else if (!string.IsNullOrEmpty(argStr))
-                        {
-                            var evalResult = _evaluator.Evaluate(argStr);
-                            stringArg = evalResult?.ToString();
-                        }
-                    }
-                    if (stringArg != null)
-                        InvokeHandler(handlerName, stringArg);
-                    else
-                        InvokeHandler(handlerName, null);
-                }
+                HandleElementEvents(element);
             }
         }
 
@@ -800,10 +806,11 @@ namespace Iris.Iml
             }
 
             GUI.changed = false;
+            GUILayout.BeginHorizontal(GUILayout.ExpandWidth(true), GUILayout.MaxWidth(200));
             float newValue = GUILayout.HorizontalSlider(currentValue, min, max);
-
             if (showValue)
-                GUILayout.Label(newValue.ToString("F2"));
+                GUILayout.Label(newValue.ToString("F2"), GUILayout.Width(50));
+            GUILayout.EndHorizontal();
 
             if (GUI.changed && !string.IsNullOrEmpty(onChanged))
             {
@@ -906,7 +913,11 @@ namespace Iris.Iml
                 var templateElement = FindTemplate(template);
                 if (templateElement != null)
                 {
-                    RenderElement(templateElement);
+                    foreach (var child in templateElement.Children)
+                    {
+                        if (child is ImlElement childElement)
+                            RenderElement(childElement);
+                    }
                 }
             }
 
@@ -954,7 +965,11 @@ namespace Iris.Iml
 
         private IrrContStyle GetContainerStyle(ImlElement element)
         {
-            var key = GetEffectiveStyleName(element)?.ToLowerInvariant();
+            var classVal = ResolveAttributeValue(element, "class")?.ToLowerInvariant();
+            var styleVal = ResolveAttributeValue(element, "style")?.ToLowerInvariant();
+            var key = classVal;
+            if (styleVal == "padding" || styleVal == "background")
+                key = styleVal;
             return key switch
             {
                 "padding" => IrrContStyle.Padding,
@@ -1004,6 +1019,45 @@ namespace Iris.Iml
                 "stop" => IrrIconStyle.Stop,
                 _ => IrrIconStyle.Information
             };
+        }
+
+        private void HandleElementEvents(ImlElement element)
+        {
+            foreach (var kv in element.Attributes)
+            {
+                if (kv.Key.StartsWith("on-") && !kv.Key.StartsWith("data-on-"))
+                {
+                    var handlerSpec = ResolveAttributeValue(element, kv.Key);
+                    if (!string.IsNullOrEmpty(handlerSpec))
+                        InvokeHandlerString(handlerSpec);
+                }
+            }
+        }
+
+        private void InvokeHandlerString(string handlerSpec)
+        {
+            string handlerName = handlerSpec;
+            string stringArg = null;
+            var parenIdx = handlerSpec.IndexOf('(');
+            if (parenIdx > 0 && handlerSpec.EndsWith(")"))
+            {
+                handlerName = handlerSpec.Substring(0, parenIdx).Trim();
+                var argStr = handlerSpec.Substring(parenIdx + 1, handlerSpec.Length - parenIdx - 2).Trim();
+                if ((argStr.StartsWith("'") && argStr.EndsWith("'")) ||
+                    (argStr.StartsWith("\"") && argStr.EndsWith("\"")))
+                {
+                    stringArg = argStr.Substring(1, argStr.Length - 2);
+                }
+                else if (!string.IsNullOrEmpty(argStr))
+                {
+                    var evalResult = _evaluator.Evaluate(argStr);
+                    stringArg = evalResult?.ToString();
+                }
+            }
+            if (stringArg != null)
+                InvokeHandler(handlerName, stringArg);
+            else
+                InvokeHandler(handlerName, null);
         }
 
         private void InvokeCommand(string commandPath)
@@ -1092,6 +1146,12 @@ namespace Iris.Iml
 
             if (style.Setters.TryGetValue("maxWidth", out var maxW) && int.TryParse(maxW, out var maxWidth))
                 options.Add(GUILayout.MaxWidth(maxWidth));
+
+            if (style.Setters.TryGetValue("minHeight", out var minH) && int.TryParse(minH, out var minHeight))
+                options.Add(GUILayout.MinHeight(minHeight));
+
+            if (style.Setters.TryGetValue("maxHeight", out var maxH) && int.TryParse(maxH, out var maxHeight))
+                options.Add(GUILayout.MaxHeight(maxHeight));
 
             options.Add(GUILayout.ExpandWidth(!style.Setters.ContainsKey("width")));
             options.Add(GUILayout.ExpandHeight(!style.Setters.ContainsKey("height")));

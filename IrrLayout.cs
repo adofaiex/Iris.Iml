@@ -18,6 +18,7 @@ namespace Iris.Iml
         bool? Checkbox(bool on);
         void Separator();
         void Space(double size);
+        void Fill();
         string? TextField(string content);
         bool Icon(IrrIconStyle style);
     }

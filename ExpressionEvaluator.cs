@@ -347,7 +347,10 @@ namespace Iris.Iml
 
             if (segments.Length > 0)
             {
-                result = _context.GetValue(segments[0]);
+                if (_localVariables.TryGetValue(segments[0], out var localVal))
+                    result = localVal;
+                else
+                    result = _context.GetValue(segments[0]);
 
                 for (int i = 1; i < segments.Length; i++)
                 {
