@@ -1,0 +1,61 @@
+<Project Sdk="Microsoft.NET.Sdk">
+	<PropertyGroup>
+		<TargetFramework>net481</TargetFramework>
+		<OutputType>Library</OutputType>
+		<RootNamespace>Iris.Iml</RootNamespace>
+		<AssemblyName>Iris.Iml</AssemblyName>
+		<LangVersion>latest</LangVersion>
+		<Nullable>enable</Nullable>
+		<GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+		<OutputPath>..\..\out\Iris.Iml\</OutputPath>
+		<AllowUnsafeBlocks>false</AllowUnsafeBlocks>
+		<CopyLocalLockFileAssemblies>false</CopyLocalLockFileAssemblies>
+		<AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+	</PropertyGroup>
+	<PropertyGroup Condition="'$(Configuration)'=='Debug'">
+		<DebugSymbols>true</DebugSymbols>
+		<DebugType>portable</DebugType>
+		<Optimize>false</Optimize>
+		<DefineConstants>DEBUG;TRACE</DefineConstants>
+	</PropertyGroup>
+	<PropertyGroup Condition="'$(Configuration)'=='Release'">
+		<DebugType>portable</DebugType>
+		<Optimize>true</Optimize>
+		<DefineConstants>TRACE</DefineConstants>
+	</PropertyGroup>
+
+	<ItemGroup>
+		<Reference Include="0Harmony">
+			<HintPath>..\..\lib\ModManager\0Harmony.dll</HintPath>
+			<Private>false</Private>
+		</Reference>
+		<Reference Include="Assembly-CSharp">
+			<HintPath>..\..\lib\v2.9.8\Assembly-CSharp.dll</HintPath>
+			<Private>false</Private>
+		</Reference>
+		<Reference Include="Assembly-CSharp-firstpass">
+			<HintPath>..\..\lib\v2.9.8\Assembly-CSharp-firstpass.dll</HintPath>
+			<Private>false</Private>
+		</Reference>
+		<Reference Include="UnityEngine">
+			<HintPath>..\..\lib\v2.9.8\UnityEngine.dll</HintPath>
+			<Private>false</Private>
+		</Reference>
+		<Reference Include="UnityEngine.CoreModule">
+			<HintPath>..\..\lib\v2.9.8\UnityEngine.CoreModule.dll</HintPath>
+			<Private>false</Private>
+		</Reference>
+		<Reference Include="UnityEngine.IMGUIModule">
+			<HintPath>..\..\lib\v2.9.8\UnityEngine.IMGUIModule.dll</HintPath>
+			<Private>false</Private>
+		</Reference>
+		<Reference Include="UnityEngine.InputLegacyModule">
+			<HintPath>..\..\lib\v2.9.8\UnityEngine.InputLegacyModule.dll</HintPath>
+			<Private>false</Private>
+		</Reference>
+		<Reference Include="UnityEngine.ImageConversionModule">
+			<HintPath>..\..\lib\v2.9.8\UnityEngine.ImageConversionModule.dll</HintPath>
+			<Private>false</Private>
+		</Reference>
+	</ItemGroup>
+</Project>

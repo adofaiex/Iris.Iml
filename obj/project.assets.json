@@ -1,0 +1,63 @@
+{
+  "version": 3,
+  "targets": {
+    ".NETFramework,Version=v4.8.1": {}
+  },
+  "libraries": {},
+  "projectFileDependencyGroups": {
+    ".NETFramework,Version=v4.8.1": []
+  },
+  "packageFolders": {
+    "C:\\Users\\Xbodw\\.nuget\\packages\\": {},
+    "F:\\VisualStudioShared\\NuGetPackages": {}
+  },
+  "project": {
+    "version": "1.0.0",
+    "restore": {
+      "projectUniqueName": "I:\\Desktop\\.New\\Iridium\\architectury\\Iris.Iml\\Iris.Iml.csproj",
+      "projectName": "Iris.Iml",
+      "projectPath": "I:\\Desktop\\.New\\Iridium\\architectury\\Iris.Iml\\Iris.Iml.csproj",
+      "packagesPath": "C:\\Users\\Xbodw\\.nuget\\packages\\",
+      "outputPath": "I:\\Desktop\\.New\\Iridium\\architectury\\Iris.Iml\\obj\\",
+      "projectStyle": "PackageReference",
+      "fallbackFolders": [
+        "F:\\VisualStudioShared\\NuGetPackages"
+      ],
+      "configFilePaths": [
+        "I:\\Desktop\\.New\\Iridium\\NuGet.Config",
+        "C:\\Users\\Xbodw\\AppData\\Roaming\\NuGet\\NuGet.Config",
+        "C:\\Program Files (x86)\\NuGet\\Config\\Microsoft.VisualStudio.FallbackLocation.config",
+        "C:\\Program Files (x86)\\NuGet\\Config\\Microsoft.VisualStudio.Offline.config"
+      ],
+      "originalTargetFrameworks": [
+        "net481"
+      ],
+      "sources": {
+        "https://api.nuget.org/v3/index.json": {}
+      },
+      "frameworks": {
+        "net481": {
+          "targetAlias": "net481",
+          "projectReferences": {}
+        }
+      },
+      "warningProperties": {
+        "warnAsError": [
+          "NU1605"
+        ]
+      },
+      "restoreAuditProperties": {
+        "enableAudit": "true",
+        "auditLevel": "low",
+        "auditMode": "direct"
+      },
+      "SdkAnalysisLevel": "9.0.300"
+    },
+    "frameworks": {
+      "net481": {
+        "targetAlias": "net481",
+        "runtimeIdentifierGraphPath": "C:\\Program Files\\dotnet\\sdk\\9.0.315\\RuntimeIdentifierGraph.json"
+      }
+    }
+  }
+}

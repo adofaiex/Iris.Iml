@@ -1,0 +1,8 @@
+I:\Desktop\.New\Iridium\out\Iris.Iml\Iris.Iml.dll
+I:\Desktop\.New\Iridium\out\Iris.Iml\Iris.Iml.pdb
+I:\Desktop\.New\Iridium\architectury\Iris.Iml\obj\Debug\Iris.Iml.csproj.AssemblyReference.cache
+I:\Desktop\.New\Iridium\architectury\Iris.Iml\obj\Debug\Iris.Iml.GeneratedMSBuildEditorConfig.editorconfig
+I:\Desktop\.New\Iridium\architectury\Iris.Iml\obj\Debug\Iris.Iml.csproj.CoreCompileInputs.cache
+I:\Desktop\.New\Iridium\architectury\Iris.Iml\obj\Debug\Iris.Iml.sourcelink.json
+I:\Desktop\.New\Iridium\architectury\Iris.Iml\obj\Debug\Iris.Iml.dll
+I:\Desktop\.New\Iridium\architectury\Iris.Iml\obj\Debug\Iris.Iml.pdb

@@ -1,0 +1,5 @@
+<Project>
+  <PropertyGroup>
+    <MaxCpuCount>0</MaxCpuCount>
+  </PropertyGroup>
+</Project>
