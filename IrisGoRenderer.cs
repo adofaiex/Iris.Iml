@@ -219,6 +219,10 @@ namespace Iris.Iml
             RebuildUI();
         }
 
+        /// <summary>Rebuild the UI from the currently loaded document. Use after LoadContent
+        /// to render an in-memory IML string (e.g. dynamically generated) without a file on disk.</summary>
+        public void Rebuild() => RebuildUI();
+
         public void OnGUI() { } // No-op for GO renderer
 
         private void ProcessResources() 
