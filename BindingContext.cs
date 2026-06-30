@@ -74,6 +74,17 @@ namespace Iris.Iml
             {
                 if (current == null) return null;
 
+                // IDictionary<string, object> support: many call sites build the data
+                // context dynamically (e.g. ImlWindow with variable button counts) and
+                // Dictionary's keys are not exposed as CLR properties, so reflection-based
+                // access alone cannot reach them.
+                if (current is IDictionary<string, object> dict)
+                {
+                    if (dict.TryGetValue(segment, out var v)) current = v;
+                    else return null;
+                    continue;
+                }
+
                 if (_accessors.TryGetValue(segment, out var accessor))
                 {
                     current = accessor.Getter(current);
