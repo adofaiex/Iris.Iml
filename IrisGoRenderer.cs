@@ -184,6 +184,19 @@ namespace Iris.Iml
 
         public void RegisterHandler(string name, Action<object> handler) => _genericHandlers[name] = handler;
 
+        /// <summary>
+        /// Write a value back to the data context at the given property path.
+        /// Used by input controls (TextField, etc.) when the user submits a
+        /// new value via the on-text-submit/on-changed handler chain. Without
+        /// this, the bound CLR field (e.g. <c>Settings.judgeText.tooEarly</c>)
+        /// stays at its old value, and downstream <c>Save()</c> writes the
+        /// stale value to disk.
+        /// </summary>
+        public void SetContextValue(string propertyPath, object value)
+        {
+            _dataContext?.SetValue(propertyPath, value);
+        }
+
         public void RegisterFunction(string name, Func<object[], object> func)
         {
             _registeredFunctions[name] = func;
@@ -755,6 +768,15 @@ namespace Iris.Iml
 
             input.onEndEdit.AddListener(val =>
             {
+                // Two-way binding: the value="..." expression we evaluated above
+                // for the initial read must be written back to the data context
+                // BEFORE the on-text-submit handler runs. Without this, handlers
+                // like Settings.OnJudgeTextChanged can only call Save() — they
+                // never see the new value, so the underlying CLR field (e.g.
+                // judgeText.tooEarly) stays at its old value and gets serialized
+                // back to disk on save. (Bug: "判定文本无法修改".)
+                if (!string.IsNullOrEmpty(valueBinding))
+                    SetContextValue(valueBinding, val);
                 if (!string.IsNullOrEmpty(onSubmit))
                     ScheduleEffect(() => InvokeHandler(onSubmit, val));
             });

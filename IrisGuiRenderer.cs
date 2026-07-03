@@ -70,6 +70,19 @@ namespace Iris.Iml
         }
 
         /// <summary>
+        /// Write a value back to the data context at the given property path.
+        /// Used by input controls (TextField, TextArea) when the user submits a
+        /// new value via the on-text-submit/on-changed handler chain. Without
+        /// this, the bound CLR field (e.g. <c>Settings.judgeText.tooEarly</c>)
+        /// stays at its old value, and downstream <c>Save()</c> writes the
+        /// stale value to disk. (Bug: "判定文本无法修改".)
+        /// </summary>
+        public void SetContextValue(string propertyPath, object value)
+        {
+            _dataContext?.SetValue(propertyPath, value);
+        }
+
+        /// <summary>
         /// 注册事件处理程序
         /// </summary>
         public void RegisterHandler(string name, Action handler)
@@ -747,6 +760,12 @@ namespace Iris.Iml
                 result = GUI.changed ? newValue : (bool?)null;
             }
 
+            // Two-way binding: write the new value back to the data context
+            // BEFORE invoking the on-changed handler, so handlers can also
+            // rely on the bound field being up-to-date (in addition to the
+            // explicit `value = obj` they receive in their handler body).
+            if (result.HasValue && !string.IsNullOrEmpty(valueBinding))
+                SetContextValue(valueBinding, result.Value);
             if (result.HasValue && !string.IsNullOrEmpty(onChanged))
                 ScheduleEffect(() => InvokeHandler(onChanged, result.Value));
         }
@@ -782,6 +801,8 @@ namespace Iris.Iml
                 result = GUI.changed ? newValue : (bool?)null;
             }
 
+            if (result.HasValue && !string.IsNullOrEmpty(valueBinding))
+                SetContextValue(valueBinding, result.Value);
             if (result.HasValue && !string.IsNullOrEmpty(onChanged))
                 ScheduleEffect(() => InvokeHandler(onChanged, result.Value));
         }
@@ -812,6 +833,10 @@ namespace Iris.Iml
                 GUILayout.Label(newValue.ToString("F2"), GUILayout.Width(50));
             GUILayout.EndHorizontal();
 
+            // Two-way binding: write the new value back to the data context
+            // BEFORE invoking the on-changed handler.
+            if (GUI.changed && !string.IsNullOrEmpty(valueBinding))
+                SetContextValue(valueBinding, newValue);
             if (GUI.changed && !string.IsNullOrEmpty(onChanged))
             {
                 ScheduleEffect(() => InvokeHandler(onChanged, newValue));
@@ -843,6 +868,14 @@ namespace Iris.Iml
                     newValue = null;
             }
 
+            // Two-way binding: write the new value back to the data context
+            // BEFORE invoking the user handler, so handlers like
+            // Settings.OnJudgeTextChanged (which only call Save()) actually
+            // have the new value to persist. Without this, the bound CLR
+            // field stays at its old value. (Bug: "判定文本无法修改".)
+            if (newValue != null && !string.IsNullOrEmpty(valueBinding))
+                SetContextValue(valueBinding, newValue);
+
             if (newValue != null && !string.IsNullOrEmpty(onSubmit))
                 ScheduleEffect(() => InvokeHandler(onSubmit, newValue));
 
@@ -866,10 +899,11 @@ namespace Iris.Iml
             GUI.changed = false;
             string newValue = GUILayout.TextArea(currentValue, lines, GUILayout.ExpandWidth(true), GUILayout.Height(lines * 20));
 
+            // Two-way binding: write the new value back to the data context
+            // when the user edits. (Bug: "判定文本无法修改" — without this, the
+            // bound CLR field never sees the new value.)
             if (GUI.changed && !string.IsNullOrEmpty(valueBinding))
-            {
-                // Handler is responsible for writing back to settings
-            }
+                SetContextValue(valueBinding, newValue);
         }
 
         private void RenderSeparator(ImlElement element)
