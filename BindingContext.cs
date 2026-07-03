@@ -173,7 +173,7 @@ namespace Iris.Iml
                 }
             }
 
-            // Set final property
+            // Set final property/field
             var finalSegment = segments[segments.Length - 1];
             var targetType = current.GetType();
 
@@ -191,6 +191,16 @@ namespace Iris.Iml
                     var oldValue = prop.GetValue(current);
                     prop.SetValue(current, value);
                     PropertyChanged?.Invoke(propertyPath, oldValue, value);
+                }
+                else
+                {
+                    var field = targetType.GetField(finalSegment);
+                    if (field != null)
+                    {
+                        var oldValue = field.GetValue(current);
+                        field.SetValue(current, value);
+                        PropertyChanged?.Invoke(propertyPath, oldValue, value);
+                    }
                 }
             }
         }

@@ -21,6 +21,7 @@ namespace Iris.Iml
         private readonly Dictionary<string, Action<Rect, RendererInternal.DrawArgs>> _drawHandlers = new();
         private readonly Dictionary<string, Texture2D> _textureCache = new();
         private readonly Dictionary<string, ImlStyle> _styleCache = new();
+        private readonly List<ImlStyle> _selectorStyles = new();
 
         private bool _hotReloadEnabled = false;
         private FileSystemWatcher _fileWatcher;
@@ -175,6 +176,7 @@ namespace Iris.Iml
             _document = _parser.Parse(filePath);
             ProcessResources();
             _styleCache.Clear();
+            _selectorStyles.Clear();
             _forEachCollections.Clear();
             _referenceCache.Clear();
 
@@ -190,6 +192,7 @@ namespace Iris.Iml
             _document = _parser.ParseContent(imlContent, basePath);
             ProcessResources();
             _styleCache.Clear();
+            _selectorStyles.Clear();
             _forEachCollections.Clear();
         }
 
@@ -228,10 +231,17 @@ namespace Iris.Iml
                     if (childElement.TagName == "Style")
                     {
                         var style = ParseStyle(childElement);
-                        _styleCache[style.Name.ToLowerInvariant()] = style;
+                        if (!string.IsNullOrEmpty(style.Name))
+                            _styleCache[style.Name.ToLowerInvariant()] = style;
+                        if (style.Selector != null)
+                            _selectorStyles.Add(style);
                     }
                 }
             }
+
+            // Sort selectors by specificity ascending so GetEffectiveStyle can
+            // apply them in order (later = higher specificity = wins).
+            _selectorStyles.Sort((a, b) => a.Selector.Specificity.CompareTo(b.Selector.Specificity));
         }
 
         private ImlStyle ParseStyle(ImlElement element)
@@ -239,7 +249,8 @@ namespace Iris.Iml
             var style = new ImlStyle
             {
                 Name = element.GetString("name"),
-                Extends = element.GetString("extends")
+                Extends = element.GetString("extends"),
+                Selector = StyleSelector.Parse(element.GetString("on"))
             };
 
             foreach (var child in element.Children)
@@ -337,6 +348,7 @@ namespace Iris.Iml
             {
                 case "Iris":
                 case "If":
+                case "":
                     RenderChildren(element);
                     break;
 
@@ -431,6 +443,15 @@ namespace Iris.Iml
             {
                 if (child is ImlElement childElement)
                     RenderElement(childElement);
+                else if (child is ExpressionValue ev && !string.IsNullOrWhiteSpace(ev.Expression))
+                {
+                    var evaluated = _evaluator.Evaluate(ev.Expression);
+                    var text = evaluated?.ToString() ?? "";
+                    if (_layout != null)
+                        _layout.Text(text, IrrTextStyle.Normal);
+                    else
+                        GUILayout.Label(text);
+                }
                 else if (child is string text && !string.IsNullOrWhiteSpace(text))
                 {
                     if (_layout != null)
@@ -488,12 +509,16 @@ namespace Iris.Iml
 
                     if (children[i] is ImlElement childElement)
                         RenderElement(childElement);
-                    else if (children[i] is string text && !string.IsNullOrWhiteSpace(text))
+                    else
                     {
-                        if (_layout != null)
-                            _layout.Text(text, IrrTextStyle.Normal);
-                        else
-                            GUILayout.Label(text);
+                        var text = GetFlexChildText(children[i]);
+                        if (!string.IsNullOrEmpty(text))
+                        {
+                            if (_layout != null)
+                                _layout.Text(text, IrrTextStyle.Normal);
+                            else
+                                GUILayout.Label(text);
+                        }
                     }
                 }
             }
@@ -675,6 +700,8 @@ namespace Iris.Iml
                     return sb.ToString();
                 case AttributeType.Boolean:
                     return attr.BoolValue ? "true" : "false";
+                case AttributeType.StyleObject:
+                    return "";
                 default:
                     return attr.StringValue ?? "";
             }
@@ -1034,6 +1061,17 @@ namespace Iris.Iml
             };
         }
 
+        private string GetFlexChildText(object child)
+        {
+            if (child is string s) return s;
+            if (child is ExpressionValue ev && !string.IsNullOrWhiteSpace(ev.Expression))
+            {
+                try { return _evaluator.Evaluate(ev.Expression)?.ToString() ?? ""; }
+                catch { return ""; }
+            }
+            return "";
+        }
+
         private void RenderIcon(ImlElement element)
         {
             if (_layout == null) return;
@@ -1153,16 +1191,39 @@ namespace Iris.Iml
 
         private ImlStyle GetEffectiveStyle(ImlElement element)
         {
-            var className = element.GetString("class");
-            var styleName = ResolveAttributeValue(element, "style");
+            var merged = new ImlStyle();
+            var tag = element.TagName?.ToLowerInvariant();
+            var cls = element.GetString("class")?.ToLowerInvariant();
+            var id = element.GetString("id")?.ToLowerInvariant();
 
-            if (!string.IsNullOrEmpty(styleName) && _styleCache.TryGetValue(styleName.ToLowerInvariant(), out var style))
-                return style;
+            // 1. Selector-based styles (sorted by specificity ascending)
+            foreach (var ss in _selectorStyles)
+            {
+                if (ss.Selector != null && ss.Selector.Matches(tag, cls, id))
+                    foreach (var kv in ss.Setters)
+                        merged.Setters[kv.Key] = kv.Value;
+            }
 
-            if (!string.IsNullOrEmpty(className) && _styleCache.TryGetValue(className.ToLowerInvariant(), out style))
-                return style;
+            // 2. Named style from cache (via style="name")
+            if (element.Attributes.TryGetValue("style", out var styleAttr))
+            {
+                if (styleAttr.Type == AttributeType.String || styleAttr.Type == AttributeType.Expression)
+                {
+                    var styleName = ResolveAttributeValue(element, "style");
+                    if (!string.IsNullOrEmpty(styleName) && _styleCache.TryGetValue(styleName.ToLowerInvariant(), out var namedStyle))
+                        foreach (var kv in namedStyle.Setters)
+                            merged.Setters[kv.Key] = kv.Value;
+                }
+                // 3. Inline StyleObject: style={{ key: value, ... }}
+                else if (styleAttr.Type == AttributeType.StyleObject && styleAttr.StyleEntries != null)
+                {
+                    foreach (var entry in styleAttr.StyleEntries)
+                        if (!string.IsNullOrEmpty(entry.Property))
+                            merged.Setters[entry.Property] = entry.Value;
+                }
+            }
 
-            return new ImlStyle();
+            return merged;
         }
 
         private GUILayoutOption[] GetStyleOptions(ImlStyle style)
@@ -1258,6 +1319,7 @@ namespace Iris.Iml
     {
         public string Name { get; set; }
         public string Extends { get; set; }
+        public StyleSelector Selector { get; set; }
         public Dictionary<string, string> Setters { get; } = new();
     }
 

@@ -28,6 +28,10 @@ namespace Iris.Iml
         private static readonly Regex SecurityTypeInspectionPattern = new(@"\b(typeof|GetType)\b", RegexOptions.Compiled);
         private static readonly Regex SecurityAssignmentPattern = new(@"(?<![=!<>])=(?!=)", RegexOptions.Compiled);
 
+        // Fast path: simple dotted property paths (e.g. "settings.currentTab", "item.name")
+        // These can skip CheckSecurity and the entire ParseAndEvaluate pipeline.
+        private static readonly Regex SimplePropertyPathPattern = new(@"^[a-zA-Z_][a-zA-Z0-9_]*(\.[a-zA-Z_][a-zA-Z0-9_]*)*$", RegexOptions.Compiled);
+
         private readonly BindingContext _context;
         private readonly Dictionary<string, object> _localVariables = new();
         private readonly Dictionary<string, Func<object[], object>> _allowedFunctions = new();
@@ -59,6 +63,10 @@ namespace Iris.Iml
                 return null;
 
             expression = expression.Trim();
+
+            // Fast path: simple dotted property path — skip all parsing & security checks
+            if (SimplePropertyPathPattern.IsMatch(expression))
+                return ResolveValue(expression);
 
             var sw = System.Diagnostics.Stopwatch.StartNew();
 
@@ -476,6 +484,10 @@ namespace Iris.Iml
 
         private object ApplyArithmetic(object left, object right, string op)
         {
+            // String concatenation
+            if (op == "+" && (left is string || right is string))
+                return (left?.ToString() ?? "") + (right?.ToString() ?? "");
+
             double l, r;
 
             if (left == null && right == null)

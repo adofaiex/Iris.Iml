@@ -19,6 +19,7 @@ namespace Iris.Iml
         private readonly Dictionary<string, Action<Rect, RendererInternal.DrawArgs>> _drawHandlers = new();
         private readonly Dictionary<string, Texture2D> _textureCache = new();
         private readonly Dictionary<string, ImlStyle> _styleCache = new();
+        private readonly List<ImlStyle> _selectorStyles = new();
         private readonly Dictionary<string, Func<object[], object>> _registeredFunctions = new();
 
         private IIrrLayout _layout;
@@ -244,6 +245,7 @@ namespace Iris.Iml
             // Clear before repopulating so a subsequent LoadFile doesn't carry over styles
             // from the previous IML file.
             _styleCache.Clear();
+            _selectorStyles.Clear();
             foreach (var child in _document.Root.Children)
                 if (child is ImlElement e && e.TagName == "Resources")
                     ProcessResourceElement(e);
@@ -255,13 +257,22 @@ namespace Iris.Iml
                 if (child is ImlElement ce && ce.TagName == "Style")
                 {
                     var style = ParseStyle(ce);
-                    _styleCache[style.Name.ToLowerInvariant()] = style;
+                    if (!string.IsNullOrEmpty(style.Name))
+                        _styleCache[style.Name.ToLowerInvariant()] = style;
+                    if (style.Selector != null)
+                        _selectorStyles.Add(style);
                 }
+            _selectorStyles.Sort((a, b) => a.Selector.Specificity.CompareTo(b.Selector.Specificity));
         }
 
         private ImlStyle ParseStyle(ImlElement element)
         {
-            var style = new ImlStyle { Name = element.GetString("name"), Extends = element.GetString("extends") };
+            var style = new ImlStyle
+            {
+                Name = element.GetString("name"),
+                Extends = element.GetString("extends"),
+                Selector = StyleSelector.Parse(element.GetString("on"))
+            };
             foreach (var child in element.Children)
                 if (child is ImlElement ce)
                 {
@@ -484,76 +495,59 @@ namespace Iris.Iml
             }
         }
 
+        private string GetChildText(object child)
+        {
+            if (child is string s) return s;
+            if (child is ExpressionValue ev && !string.IsNullOrWhiteSpace(ev.Expression))
+            {
+                try { return _evaluator.Evaluate(ev.Expression)?.ToString() ?? ""; }
+                catch { return ""; }
+            }
+            return "";
+        }
+
         private void BuildContainer(ImlElement element, Transform parent)
         {
             bool isHorizontal = element.TagName == "HBox";
             var go = new GameObject(element.TagName);
 
+            HorizontalOrVerticalLayoutGroup lg;
             if (isHorizontal)
             {
                 var hlg = go.AddComponent<HorizontalLayoutGroup>();
                 hlg.childForceExpandWidth = false;
                 hlg.childForceExpandHeight = true;
+                lg = hlg;
             }
             else
             {
                 var vlg = go.AddComponent<VerticalLayoutGroup>();
                 vlg.childForceExpandWidth = true;
                 vlg.childForceExpandHeight = false;
+                lg = vlg;
             }
 
             var csf = go.AddComponent<ContentSizeFitter>();
             csf.horizontalFit = ContentSizeFitter.FitMode.PreferredSize;
             csf.verticalFit = ContentSizeFitter.FitMode.PreferredSize;
 
-            // Handle gap
-            var gapStr = element.GetString("gap");
-            if (int.TryParse(gapStr, out var gap) && gap > 0)
-            {
-                var lg = go.GetComponent<HorizontalOrVerticalLayoutGroup>();
-                if (lg != null) lg.spacing = gap;
-            }
-
-            // Handle padding — fall back to style-defined padding when no inline padding
-            var paddingStr = element.GetString("padding");
-            if (string.IsNullOrEmpty(paddingStr))
-            {
-                var styleForPad = GetEffectiveStyle(element);
-                if (styleForPad?.Setters != null && styleForPad.Setters.TryGetValue("padding", out var sp))
-                    paddingStr = sp;
-            }
-            if (!string.IsNullOrEmpty(paddingStr))
-            {
-                var parts = paddingStr.Split(',');
-                if (parts.Length == 4 &&
-                    int.TryParse(parts[0], out var pTop) &&
-                    int.TryParse(parts[1], out var pRight) &&
-                    int.TryParse(parts[2], out var pBottom) &&
-                    int.TryParse(parts[3], out var pLeft))
-                {
-                    var lg = go.GetComponent<HorizontalOrVerticalLayoutGroup>();
-                    if (lg != null) lg.padding = new RectOffset(pLeft, pRight, pTop, pBottom);
-                }
-            }
-
-            // Apply minWidth
-            var mwStr = element.GetString("minWidth");
-            if (float.TryParse(mwStr, out var minW) && minW > 0)
-            {
-                var le = go.GetComponent<LayoutElement>() ?? go.AddComponent<LayoutElement>();
-                le.minWidth = minW;
-            }
-
-            // Apply minHeight from element or style
-            var mhStr = element.GetString("minHeight");
-            if (float.TryParse(mhStr, out var minH) && minH > 0)
-            {
-                var le = go.GetComponent<LayoutElement>() ?? go.AddComponent<LayoutElement>();
-                le.minHeight = minH;
-            }
-
-            // Apply background from style (now uses ApplyBackgroundStyle so the sprite is set)
             var style = GetEffectiveStyle(element);
+
+            // gap (from inline or style)
+            var gapStr = element.GetString("gap");
+            if (string.IsNullOrEmpty(gapStr)) style?.Setters?.TryGetValue("gap", out gapStr);
+            if (int.TryParse(gapStr, out var gap) && gap > 0) lg.spacing = gap;
+
+            // padding / margin from style
+            ApplyContainerPadding(element, style, lg, "padding");
+            ApplyContainerPadding(element, style, lg, "margin");
+
+            // flex alignment
+            ApplyFlexAlignment(style, lg, isHorizontal);
+
+            // common style + background
+            ApplyCommonStyle(go, element);
+
             if (style?.Setters != null && style.Setters.ContainsKey("background"))
             {
                 var img = go.AddComponent<Image>();
@@ -562,19 +556,41 @@ namespace Iris.Iml
 
             go.transform.SetParent(parent, false);
 
+            // Slot images + flow children
+            var bgSlots = new List<ImlElement>();
+            var fgSlots = new List<ImlElement>();
+            var flowChildren = new List<object>();
             foreach (var child in element.Children)
             {
-                if (child is ImlElement e) BuildElement(e, go.transform);
-                else if (child is string t && !string.IsNullOrWhiteSpace(t))
+                if (child is ImlElement ce)
                 {
-                    var txtGo = new GameObject("Text");
-                    var txt = txtGo.AddComponent<Text>();
-                    txt.text = t;
-                    txt.color = Color.white;
-                    txt.font = DefaultFont;
-                    txtGo.transform.SetParent(go.transform, false);
+                    var slot = ce.GetString("slot")?.ToLowerInvariant();
+                    if (slot == "background") bgSlots.Add(ce);
+                    else if (slot == "foreground") fgSlots.Add(ce);
+                    else flowChildren.Add(ce);
+                }
+                else flowChildren.Add(child);
+            }
+
+            foreach (var bg in bgSlots) BuildSlotImage(bg, go.transform);
+            foreach (var child in flowChildren)
+            {
+                if (child is ImlElement e) BuildElement(e, go.transform);
+                else
+                {
+                    var text = GetChildText(child);
+                    if (!string.IsNullOrEmpty(text))
+                    {
+                        var txtGo = new GameObject("Text");
+                        var txt = txtGo.AddComponent<Text>();
+                        txt.text = text;
+                        txt.color = Color.white;
+                        txt.font = DefaultFont;
+                        txtGo.transform.SetParent(go.transform, false);
+                    }
                 }
             }
+            foreach (var fg in fgSlots) BuildSlotImage(fg, go.transform);
         }
 
         private void BuildText(ImlElement element, Transform parent)
@@ -944,17 +960,43 @@ namespace Iris.Iml
                     }
                     return sb.ToString();
                 case AttributeType.Boolean: return attr.BoolValue ? "true" : "false";
+                case AttributeType.StyleObject: return "";
                 default: return attr.StringValue ?? "";
             }
         }
 
         private ImlStyle GetEffectiveStyle(ImlElement element)
         {
-            var cn = element.GetString("class");
-            var sn = ResolveAttributeValue(element, "style");
-            if (!string.IsNullOrEmpty(sn) && _styleCache.TryGetValue(sn.ToLowerInvariant(), out var s)) return s;
-            if (!string.IsNullOrEmpty(cn) && _styleCache.TryGetValue(cn.ToLowerInvariant(), out s)) return s;
-            return new ImlStyle();
+            var merged = new ImlStyle();
+            var tag = element.TagName?.ToLowerInvariant();
+            var cls = element.GetString("class")?.ToLowerInvariant();
+            var id = element.GetString("id")?.ToLowerInvariant();
+
+            foreach (var ss in _selectorStyles)
+            {
+                if (ss.Selector != null && ss.Selector.Matches(tag, cls, id))
+                    foreach (var kv in ss.Setters)
+                        merged.Setters[kv.Key] = kv.Value;
+            }
+
+            if (element.Attributes.TryGetValue("style", out var styleAttr))
+            {
+                if (styleAttr.Type == AttributeType.String || styleAttr.Type == AttributeType.Expression)
+                {
+                    var sn = ResolveAttributeValue(element, "style");
+                    if (!string.IsNullOrEmpty(sn) && _styleCache.TryGetValue(sn.ToLowerInvariant(), out var namedStyle))
+                        foreach (var kv in namedStyle.Setters)
+                            merged.Setters[kv.Key] = kv.Value;
+                }
+                else if (styleAttr.Type == AttributeType.StyleObject && styleAttr.StyleEntries != null)
+                {
+                    foreach (var entry in styleAttr.StyleEntries)
+                        if (!string.IsNullOrEmpty(entry.Property))
+                            merged.Setters[entry.Property] = entry.Value;
+                }
+            }
+
+            return merged;
         }
 
         private void HandleElementEvents(ImlElement element)
@@ -999,6 +1041,181 @@ namespace Iris.Iml
         private void ScheduleEffect(Action effect) { try { effect(); } catch { } }
 
         private void OnDataContextPropertyChanged(string path, object oldVal, object newVal) => _dirty = true;
+
+        // ========== CSS-like style helpers ==========
+
+        private void ApplyCommonStyle(GameObject go, ImlElement element)
+        {
+            var style = GetEffectiveStyle(element);
+            if (style?.Setters == null) return;
+
+            if (style.Setters.TryGetValue("display", out var disp) && disp == "none")
+            { go.SetActive(false); return; }
+
+            var le = GetOrAddLayoutElement(go);
+
+            if (TryStyleFloat(style, "width", out var w) && w > 0) le.preferredWidth = w;
+            if (TryStyleFloat(style, "height", out var h) && h > 0) le.preferredHeight = h;
+            if (TryStyleFloat(style, "minWidth", out var minW) && minW > 0) le.minWidth = minW;
+            if (TryStyleFloat(style, "minHeight", out var minH) && minH > 0) le.minHeight = minH;
+
+            if (style.Setters.TryGetValue("flexGrow", out var fg) && float.TryParse(fg, out var grow) && grow > 0)
+            {
+                var pLg = go.transform.parent?.GetComponent<HorizontalOrVerticalLayoutGroup>();
+                if (pLg is HorizontalLayoutGroup) le.flexibleWidth = grow;
+                else if (pLg is VerticalLayoutGroup) le.flexibleHeight = grow;
+                else { le.flexibleWidth = grow; le.flexibleHeight = grow; }
+            }
+
+            if (TryStyleFloat(style, "opacity", out var alpha) && alpha < 1f)
+                (go.GetComponent<CanvasGroup>() ?? go.AddComponent<CanvasGroup>()).alpha = alpha;
+
+            if (style.Setters.TryGetValue("textAlign", out var ta))
+            {
+                var txt = go.GetComponentInChildren<Text>();
+                if (txt != null)
+                    txt.alignment = ta switch
+                    {
+                        "left" => TextAnchor.MiddleLeft, "center" => TextAnchor.MiddleCenter,
+                        "right" => TextAnchor.MiddleRight, _ => txt.alignment
+                    };
+            }
+
+            if (style.Setters.TryGetValue("whiteSpace", out var ws) && ws == "nowrap")
+            {
+                var txt = go.GetComponentInChildren<Text>();
+                if (txt != null) txt.horizontalOverflow = HorizontalWrapMode.Overflow;
+            }
+
+            if (style.Setters.TryGetValue("overflow", out var ov) && ov == "hidden")
+            {
+                if (go.GetComponent<Mask>() == null)
+                {
+                    var maskImg = go.GetComponent<Image>() ?? go.AddComponent<Image>();
+                    maskImg.color = Color.white;
+                    maskImg.raycastTarget = false;
+                    go.AddComponent<Mask>().showMaskGraphic = false;
+                }
+            }
+
+            var rect = go.GetComponent<RectTransform>();
+            if (rect == null) return;
+
+            if (style.Setters.TryGetValue("position", out var pos) && pos == "absolute")
+            {
+                (go.GetComponent<LayoutElement>() ?? go.AddComponent<LayoutElement>()).ignoreLayout = true;
+                float? t = null, r = null, b = null, l = null;
+                if (TryStyleFloat(style, "top", out var tv)) t = tv;
+                if (TryStyleFloat(style, "right", out var rv)) r = rv;
+                if (TryStyleFloat(style, "bottom", out var bv)) b = bv;
+                if (TryStyleFloat(style, "left", out var lv)) l = lv;
+                float lo = l ?? 0, ro = r ?? 0, to = t ?? 0, bo = b ?? 0;
+                rect.anchorMin = new Vector2(l.HasValue ? 0 : r.HasValue ? 1 : rect.anchorMin.x, b.HasValue ? 0 : t.HasValue ? 1 : rect.anchorMin.y);
+                rect.anchorMax = new Vector2(r.HasValue ? 1 : l.HasValue ? 0 : rect.anchorMax.x, t.HasValue ? 1 : b.HasValue ? 0 : rect.anchorMax.y);
+                rect.offsetMin = new Vector2(lo, bo); rect.offsetMax = new Vector2(-ro, -to);
+                return;
+            }
+
+            if (style.Setters.TryGetValue("anchor", out var anchor))
+            {
+                (go.GetComponent<LayoutElement>() ?? go.AddComponent<LayoutElement>()).ignoreLayout = true;
+                switch (anchor.ToLowerInvariant())
+                {
+                    case "topleft":      SetAnchor(rect, 0, 1, 0, 1, 0, 1); break;
+                    case "topcenter":    SetAnchor(rect, 0.5f, 1, 0.5f, 1, 0.5f, 1); break;
+                    case "topright":     SetAnchor(rect, 1, 1, 1, 1, 1, 1); break;
+                    case "centerleft":   SetAnchor(rect, 0, 0.5f, 0, 0.5f, 0, 0.5f); break;
+                    case "center":       SetAnchor(rect, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f); break;
+                    case "centerright":  SetAnchor(rect, 1, 0.5f, 1, 0.5f, 1, 0.5f); break;
+                    case "bottomleft":   SetAnchor(rect, 0, 0, 0, 0, 0, 0); break;
+                    case "bottomcenter": SetAnchor(rect, 0.5f, 0, 0.5f, 0, 0.5f, 0); break;
+                    case "bottomright":  SetAnchor(rect, 1, 0, 1, 0, 1, 0); break;
+                    case "stretch":      SetAnchor(rect, 0, 0, 1, 1, 0.5f, 0.5f); break;
+                }
+                if (TryStyleFloat(style, "x", out var px)) rect.anchoredPosition = new Vector2(px, rect.anchoredPosition.y);
+                if (TryStyleFloat(style, "y", out var py)) rect.anchoredPosition = new Vector2(rect.anchoredPosition.x, py);
+            }
+        }
+
+        private static void SetAnchor(RectTransform rt, float minX, float minY, float maxX, float maxY, float pivotX, float pivotY)
+        {
+            rt.anchorMin = new Vector2(minX, minY);
+            rt.anchorMax = new Vector2(maxX, maxY);
+            rt.pivot = new Vector2(pivotX, pivotY);
+            rt.anchoredPosition = Vector2.zero;
+            rt.sizeDelta = Vector2.zero;
+        }
+
+        private void BuildSlotImage(ImlElement element, Transform container)
+        {
+            var go = new GameObject("SlotImage");
+            var img = go.AddComponent<Image>();
+            img.raycastTarget = false;
+            var rect = go.GetComponent<RectTransform>();
+            rect.anchorMin = Vector2.zero;
+            rect.anchorMax = Vector2.one;
+            rect.sizeDelta = Vector2.zero;
+            rect.anchoredPosition = Vector2.zero;
+            go.AddComponent<LayoutElement>().ignoreLayout = true;
+            var slotStyle = GetEffectiveStyle(element);
+            if (TryParseColor(slotStyle, out var c)) img.color = c;
+            var source = element.GetString("source");
+            if (!string.IsNullOrEmpty(source))
+            {
+                var tex = LoadTexture(source);
+                if (tex != null)
+                {
+                    var raw = go.AddComponent<RawImage>();
+                    raw.texture = tex; raw.color = img.color;
+                    UnityEngine.Object.Destroy(img);
+                }
+            }
+            if (TryStyleFloat(slotStyle, "opacity", out var opacity))
+                (go.GetComponent<CanvasGroup>() ?? go.AddComponent<CanvasGroup>()).alpha = opacity;
+            ApplyCommonStyle(go, element);
+            go.transform.SetParent(container, false);
+            go.transform.SetAsFirstSibling();
+        }
+
+        private void ApplyContainerPadding(ImlElement element, ImlStyle style, HorizontalOrVerticalLayoutGroup lg, string key)
+        {
+            string val = null;
+            style?.Setters?.TryGetValue(key, out val);
+            if (string.IsNullOrEmpty(val)) return;
+            var p = val.Split(',');
+            int top, right, bottom, left;
+            if (p.Length == 1 && int.TryParse(p[0], out var all)) top = right = bottom = left = all;
+            else if (p.Length == 2 && int.TryParse(p[0], out var vert) && int.TryParse(p[1], out var horz))
+            { top = bottom = vert; left = right = horz; }
+            else if (p.Length == 4 && int.TryParse(p[0], out top) && int.TryParse(p[1], out right) && int.TryParse(p[2], out bottom) && int.TryParse(p[3], out left)) { }
+            else return;
+            lg.padding = new RectOffset(left, right, top, bottom);
+        }
+
+        private void ApplyFlexAlignment(ImlStyle style, HorizontalOrVerticalLayoutGroup lg, bool isHorizontal)
+        {
+            string justify = null, align = null;
+            if (style?.Setters != null)
+            { style.Setters.TryGetValue("justifyContent", out justify); style.Setters.TryGetValue("alignItems", out align); }
+            if (string.IsNullOrEmpty(justify) && string.IsNullOrEmpty(align)) return;
+            var (vAlign, hAlign) = isHorizontal ? (align ?? "stretch", justify ?? "start") : (justify ?? "start", align ?? "stretch");
+            TextAnchor anchor = TextAnchor.UpperCenter;
+            if (vAlign == "end") anchor = hAlign == "end" ? TextAnchor.LowerRight : hAlign == "center" ? TextAnchor.LowerCenter : TextAnchor.LowerLeft;
+            else if (vAlign == "center") anchor = hAlign == "end" ? TextAnchor.MiddleRight : hAlign == "center" ? TextAnchor.MiddleCenter : TextAnchor.MiddleLeft;
+            else anchor = hAlign == "end" ? TextAnchor.UpperRight : hAlign == "center" ? TextAnchor.UpperCenter : TextAnchor.UpperLeft;
+            lg.childAlignment = anchor;
+            if (align == "stretch" || string.IsNullOrEmpty(align))
+            { if (isHorizontal) lg.childForceExpandHeight = true; else lg.childForceExpandWidth = true; }
+        }
+
+        private static LayoutElement GetOrAddLayoutElement(GameObject go)
+            => go.GetComponent<LayoutElement>() ?? go.AddComponent<LayoutElement>();
+
+        private static bool TryStyleFloat(ImlStyle style, string key, out float value)
+        {
+            value = 0;
+            return style?.Setters != null && style.Setters.TryGetValue(key, out var s) && float.TryParse(s, out value);
+        }
 
         private Texture2D LoadTexture(string path)
         {
