@@ -132,16 +132,44 @@ namespace Iris.Iml
             for (int i = 0; i < segments.Length - 1; i++)
             {
                 if (current == null) return;
+
+                // IDictionary<string, object> support (mirrors GetValue's path
+                // so the two stay symmetric for Dictionary-based contexts).
+                if (current is IDictionary<string, object> dict)
+                {
+                    if (dict.TryGetValue(segments[i], out var dv)) current = dv;
+                    else return;
+                    continue;
+                }
+
                 if (_accessors.TryGetValue(segments[i], out var accessor))
+                {
                     current = accessor.Getter(current);
+                }
                 else
                 {
+                    // BUG FIX: GetValue's intermediate-navigation else branch
+                    // falls back from GetProperty to GetField when a segment
+                    // is a public field (e.g. Settings.judgeText). SetValue's
+                    // branch did NOT — it `return`ed silently, so any binding
+                    // path containing a public field in the middle silently
+                    // no-op'd. Symptom: typing into a TextField bound to
+                    // "settings.judgeText.tooEarly" appeared to swallow every
+                    // keystroke because the data context was never updated,
+                    // and the TextField's `content` parameter was re-read as
+                    // the stale value on the next OnGUI call.
                     var type = current.GetType();
                     var prop = type.GetProperty(segments[i]);
                     if (prop != null)
                         current = prop.GetValue(current);
                     else
-                        return;
+                    {
+                        var field = type.GetField(segments[i]);
+                        if (field != null)
+                            current = field.GetValue(current);
+                        else
+                            return;
+                    }
                 }
             }
 
