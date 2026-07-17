@@ -190,10 +190,12 @@ namespace Iris.Iml
         public void LoadContent(string imlContent, string basePath = "")
         {
             _document = _parser.ParseContent(imlContent, basePath);
+            CurrentFilePath = string.IsNullOrEmpty(basePath) ? CurrentFilePath : Path.Combine(basePath, "_generated.iml");
             ProcessResources();
             _styleCache.Clear();
             _selectorStyles.Clear();
             _forEachCollections.Clear();
+            _referenceCache.Clear();
         }
 
         private void ProcessResources()
@@ -228,7 +230,13 @@ namespace Iris.Iml
             {
                 if (child is ImlElement childElement)
                 {
-                    if (childElement.TagName == "Style")
+                    if (childElement.TagName == "Reference")
+                    {
+                        var path = childElement.GetString("path");
+                        if (!string.IsNullOrEmpty(path))
+                            ProcessReferencedFile(path);
+                    }
+                    else if (childElement.TagName == "Style")
                     {
                         var style = ParseStyle(childElement);
                         if (!string.IsNullOrEmpty(style.Name))
@@ -242,6 +250,23 @@ namespace Iris.Iml
             // Sort selectors by specificity ascending so GetEffectiveStyle can
             // apply them in order (later = higher specificity = wins).
             _selectorStyles.Sort((a, b) => a.Selector.Specificity.CompareTo(b.Selector.Specificity));
+        }
+
+        private void ProcessReferencedFile(string path)
+        {
+            try
+            {
+                var refPath = ResolveReferencePath(path);
+                if (!File.Exists(refPath)) return;
+                if (_referenceCache.ContainsKey(refPath)) return;
+                var refDoc = _parser.Parse(refPath);
+                _referenceCache[refPath] = refDoc;
+                ProcessReferencedResources(refDoc);
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning($"[Iris.Iml] Failed to process referenced resources: {path} - {ex.Message}");
+            }
         }
 
         private ImlStyle ParseStyle(ImlElement element)

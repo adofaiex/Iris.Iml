@@ -21,6 +21,7 @@ namespace Iris.Iml
         private readonly Dictionary<string, ImlStyle> _styleCache = new();
         private readonly List<ImlStyle> _selectorStyles = new();
         private readonly Dictionary<string, Func<object[], object>> _registeredFunctions = new();
+        private readonly HashSet<string> _parsedRefs = new();
 
         private IIrrLayout _layout;
         private GameObject _rootObject;
@@ -215,6 +216,7 @@ namespace Iris.Iml
         {
             CurrentFilePath = filePath;
             _document = _parser.Parse(filePath);
+            _referenceCache.Clear();
             ProcessResources();
             _dirty = true;
         }
@@ -222,6 +224,7 @@ namespace Iris.Iml
         public void LoadContent(string imlContent, string basePath = "")
         {
             _document = _parser.ParseContent(imlContent, basePath);
+            CurrentFilePath = Path.Combine(basePath, "_generated.iml");
             ProcessResources();
             _dirty = true;
         }
@@ -246,6 +249,7 @@ namespace Iris.Iml
             // from the previous IML file.
             _styleCache.Clear();
             _selectorStyles.Clear();
+            _parsedRefs.Clear();
             foreach (var child in _document.Root.Children)
                 if (child is ImlElement e && e.TagName == "Resources")
                     ProcessResourceElement(e);
@@ -254,15 +258,94 @@ namespace Iris.Iml
         private void ProcessResourceElement(ImlElement element)
         {
             foreach (var child in element.Children)
-                if (child is ImlElement ce && ce.TagName == "Style")
+                if (child is ImlElement ce)
                 {
-                    var style = ParseStyle(ce);
-                    if (!string.IsNullOrEmpty(style.Name))
-                        _styleCache[style.Name.ToLowerInvariant()] = style;
-                    if (style.Selector != null)
-                        _selectorStyles.Add(style);
+                    if (ce.TagName == "Reference")
+                    {
+                        var path = ce.GetString("path");
+                        if (!string.IsNullOrEmpty(path))
+                            ProcessReferencedFile(path);
+                    }
+                    else if (ce.TagName == "Style")
+                    {
+                        var style = ParseStyle(ce);
+                        if (!string.IsNullOrEmpty(style.Name))
+                            _styleCache[style.Name.ToLowerInvariant()] = style;
+                        if (style.Selector != null)
+                            _selectorStyles.Add(style);
+                    }
                 }
             _selectorStyles.Sort((a, b) => a.Selector.Specificity.CompareTo(b.Selector.Specificity));
+        }
+
+        private readonly Dictionary<string, ImlDocument> _referenceCache = new();
+
+        private void RenderReference(ImlElement element, Transform parent)
+        {
+            var path = element.GetString("path");
+            if (string.IsNullOrEmpty(path)) return;
+
+            try
+            {
+                var refPath = ResolveReferencePath(path);
+                if (!File.Exists(refPath))
+                {
+                    Debug.LogWarning($"[Iris.Iml] Reference file not found: {refPath}");
+                    return;
+                }
+
+                if (!_referenceCache.TryGetValue(refPath, out var refDoc))
+                {
+                    refDoc = _parser.Parse(refPath);
+                    _referenceCache[refPath] = refDoc;
+                    ProcessReferencedResources(refDoc);
+                }
+
+                if (refDoc?.Root != null)
+                    BuildElement(refDoc.Root, parent);
+            }
+            catch (Exception ex)
+            {
+                Debug.LogError($"[Iris.Iml] Failed to render reference: {path} - {ex.Message}");
+            }
+        }
+
+        private void ProcessReferencedFile(string path)
+        {
+            try
+            {
+                var refPath = ResolveReferencePath(path);
+                if (!File.Exists(refPath)) return;
+                if (_parsedRefs.Contains(refPath)) return;
+                _parsedRefs.Add(refPath);
+                var refDoc = _parser.Parse(refPath);
+                ProcessReferencedResources(refDoc);
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning($"[Iris.Iml] Failed to process referenced resources: {path} - {ex.Message}");
+            }
+        }
+
+        private void ProcessReferencedResources(ImlDocument doc)
+        {
+            if (doc?.Root == null) return;
+            foreach (var child in doc.Root.Children)
+                if (child is ImlElement e && e.TagName == "Resources")
+                    ProcessResourceElement(e);
+        }
+
+        private string ResolveReferencePath(string path)
+        {
+            if (string.IsNullOrEmpty(path)) return path;
+            if (path.StartsWith("@/"))
+                return Path.GetFullPath(Path.Combine(
+                    Path.GetDirectoryName(CurrentFilePath) ?? "", "..", "..", path.Substring(2)));
+            if (path.StartsWith("@"))
+                return Path.GetFullPath(Path.Combine(
+                    Path.GetDirectoryName(CurrentFilePath) ?? "", path.Substring(1)));
+            return Path.GetFullPath(Path.Combine(
+                Path.GetDirectoryName(CurrentFilePath) ?? "", path));
         }
 
         private ImlStyle ParseStyle(ImlElement element)
@@ -457,8 +540,7 @@ namespace Iris.Iml
                     break;
 
                 case "Reference":
-                    // References are rendered inline during OnGUI in GuiRenderer
-                    // For GO renderer, skip for now
+                    RenderReference(element, parent);
                     break;
 
                 // Meta tags — skip
