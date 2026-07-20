@@ -110,100 +110,110 @@ namespace Iris.Iml
             return current;
         }
 
-        public void SetValue(string propertyPath, object value)
-        {
-            if (string.IsNullOrEmpty(propertyPath))
-                return;
+		public void SetValue(string propertyPath, object value)
+		{
+			if (string.IsNullOrEmpty(propertyPath))
+				return;
 
-            var segments = propertyPath.Split('.');
-            if (segments.Length == 1)
-            {
-                if (_accessors.TryGetValue(segments[0], out var accessor) && accessor.Setter != null)
-                {
-                    var oldValue = accessor.Getter(_data);
-                    accessor.Setter(_data, value);
-                    PropertyChanged?.Invoke(propertyPath, oldValue, value);
-                    return;
-                }
-            }
+			var segments = propertyPath.Split('.');
+			if (segments.Length == 1)
+			{
+				if (_accessors.TryGetValue(segments[0], out var accessor) && accessor.Setter != null)
+				{
+					var oldValue = accessor.Getter(_data);
+					var ft = accessor.Property?.PropertyType ?? accessor.Field?.FieldType;
+					accessor.Setter(_data, ConvertToTargetType(value, ft));
+					PropertyChanged?.Invoke(propertyPath, oldValue, value);
+					return;
+				}
+			}
 
-            // Navigate to parent
-            object current = _data;
-            for (int i = 0; i < segments.Length - 1; i++)
-            {
-                if (current == null) return;
+			// Navigate to parent
+			object current = _data;
+			for (int i = 0; i < segments.Length - 1; i++)
+			{
+				if (current == null) return;
 
-                // IDictionary<string, object> support (mirrors GetValue's path
-                // so the two stay symmetric for Dictionary-based contexts).
-                if (current is IDictionary<string, object> dict)
-                {
-                    if (dict.TryGetValue(segments[i], out var dv)) current = dv;
-                    else return;
-                    continue;
-                }
+				// IDictionary<string, object> support (mirrors GetValue's path
+				// so the two stay symmetric for Dictionary-based contexts).
+				if (current is IDictionary<string, object> dict)
+				{
+					if (dict.TryGetValue(segments[i], out var dv)) current = dv;
+					else return;
+					continue;
+				}
 
-                if (_accessors.TryGetValue(segments[i], out var accessor))
-                {
-                    current = accessor.Getter(current);
-                }
-                else
-                {
-                    // BUG FIX: GetValue's intermediate-navigation else branch
-                    // falls back from GetProperty to GetField when a segment
-                    // is a public field (e.g. Settings.judgeText). SetValue's
-                    // branch did NOT — it `return`ed silently, so any binding
-                    // path containing a public field in the middle silently
-                    // no-op'd. Symptom: typing into a TextField bound to
-                    // "settings.judgeText.tooEarly" appeared to swallow every
-                    // keystroke because the data context was never updated,
-                    // and the TextField's `content` parameter was re-read as
-                    // the stale value on the next OnGUI call.
-                    var type = current.GetType();
-                    var prop = type.GetProperty(segments[i]);
-                    if (prop != null)
-                        current = prop.GetValue(current);
-                    else
-                    {
-                        var field = type.GetField(segments[i]);
-                        if (field != null)
-                            current = field.GetValue(current);
-                        else
-                            return;
-                    }
-                }
-            }
+				if (_accessors.TryGetValue(segments[i], out var accessor))
+				{
+					current = accessor.Getter(current);
+				}
+				else
+				{
+					// BUG FIX: GetValue's intermediate-navigation else branch
+					// falls back from GetProperty to GetField when a segment
+					// is a public field (e.g. Settings.judgeText). SetValue's
+					// branch did NOT — it `return`ed silently, so any binding
+					// path containing a public field in the middle silently
+					// no-op'd. Symptom: typing into a TextField bound to
+					// "settings.judgeText.tooEarly" appeared to swallow every
+					// keystroke because the data context was never updated,
+					// and the TextField's `content` parameter was re-read as
+					// the stale value on the next OnGUI call.
+					var type = current.GetType();
+					var prop = type.GetProperty(segments[i]);
+					if (prop != null)
+						current = prop.GetValue(current);
+					else
+					{
+						var field = type.GetField(segments[i]);
+						if (field != null)
+							current = field.GetValue(current);
+						else
+							return;
+					}
+				}
+			}
 
-            // Set final property/field
-            var finalSegment = segments[segments.Length - 1];
-            var targetType = current.GetType();
+			// Set final property/field
+			var finalSegment = segments[segments.Length - 1];
+			var targetType = current.GetType();
 
-            if (_accessors.TryGetValue(finalSegment, out var finalAccessor) && finalAccessor.Setter != null)
-            {
-                var oldValue = finalAccessor.Getter(current);
-                finalAccessor.Setter(current, value);
-                PropertyChanged?.Invoke(propertyPath, oldValue, value);
-            }
-            else
-            {
-                var prop = targetType.GetProperty(finalSegment);
-                if (prop != null && prop.CanWrite)
-                {
-                    var oldValue = prop.GetValue(current);
-                    prop.SetValue(current, value);
-                    PropertyChanged?.Invoke(propertyPath, oldValue, value);
-                }
-                else
-                {
-                    var field = targetType.GetField(finalSegment);
-                    if (field != null)
-                    {
-                        var oldValue = field.GetValue(current);
-                        field.SetValue(current, value);
-                        PropertyChanged?.Invoke(propertyPath, oldValue, value);
-                    }
-                }
-            }
-        }
+			if (_accessors.TryGetValue(finalSegment, out var finalAccessor) && finalAccessor.Setter != null)
+			{
+				var oldValue = finalAccessor.Getter(current);
+				var ft = finalAccessor.Property?.PropertyType ?? finalAccessor.Field?.FieldType;
+				finalAccessor.Setter(current, ConvertToTargetType(value, ft));
+				PropertyChanged?.Invoke(propertyPath, oldValue, value);
+			}
+			else
+			{
+				var prop = targetType.GetProperty(finalSegment);
+				if (prop != null && prop.CanWrite)
+				{
+					var oldValue = prop.GetValue(current);
+					prop.SetValue(current, ConvertToTargetType(value, prop.PropertyType));
+					PropertyChanged?.Invoke(propertyPath, oldValue, value);
+				}
+				else
+				{
+					var field = targetType.GetField(finalSegment);
+					if (field != null)
+					{
+						var oldValue = field.GetValue(current);
+						field.SetValue(current, ConvertToTargetType(value, field.FieldType));
+						PropertyChanged?.Invoke(propertyPath, oldValue, value);
+					}
+				}
+			}
+		}
+
+		private static object ConvertToTargetType(object value, Type targetType)
+		{
+			if (value == null || targetType == null || targetType.IsInstanceOfType(value))
+				return value;
+			try { return Convert.ChangeType(value, targetType); }
+			catch { return value; }
+		}
 
         private class PropertyAccessor
         {

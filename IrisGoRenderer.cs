@@ -830,9 +830,91 @@ namespace Iris.Iml
 
             var go = new GameObject("Slider");
             var sl = go.AddComponent<Slider>();
+
+            // Background — provides the raycast target so the slider is clickable
+            var bg = new GameObject("Background", typeof(Image));
+            var bgRect = bg.GetComponent<RectTransform>();
+            bgRect.anchorMin = Vector2.zero;
+            bgRect.anchorMax = Vector2.one;
+            bgRect.offsetMin = new Vector2(10, 0);
+            bgRect.offsetMax = new Vector2(-10, 0);
+            var bgImg = bg.GetComponent<Image>();
+            bgImg.color = new Color(0.2f, 0.2f, 0.2f, 1);
+            bg.transform.SetParent(go.transform, false);
+
+            // Fill Area
+            var fillArea = new GameObject("Fill Area", typeof(RectTransform));
+            var fillAreaRect = fillArea.GetComponent<RectTransform>();
+            fillAreaRect.anchorMin = Vector2.zero;
+            fillAreaRect.anchorMax = Vector2.one;
+            fillAreaRect.offsetMin = new Vector2(10, 2);
+            fillAreaRect.offsetMax = new Vector2(-10, -2);
+            fillArea.transform.SetParent(go.transform, false);
+
+            var fill = new GameObject("Fill", typeof(Image));
+            var fillRect = fill.GetComponent<RectTransform>();
+            fillRect.anchorMin = Vector2.zero;
+            fillRect.anchorMax = Vector2.one;
+            fillRect.offsetMin = Vector2.zero;
+            fillRect.offsetMax = Vector2.zero;
+            var fillImg = fill.GetComponent<Image>();
+            fillImg.color = new Color(0.4f, 0.6f, 1f, 1);
+            fill.transform.SetParent(fillArea.transform, false);
+
+            // Handle
+            var handleArea = new GameObject("Handle Slide Area", typeof(RectTransform));
+            var handleAreaRect = handleArea.GetComponent<RectTransform>();
+            handleAreaRect.anchorMin = Vector2.zero;
+            handleAreaRect.anchorMax = Vector2.one;
+            handleAreaRect.offsetMin = new Vector2(10, 0);
+            handleAreaRect.offsetMax = new Vector2(-10, 0);
+            handleArea.transform.SetParent(go.transform, false);
+
+            var handle = new GameObject("Handle", typeof(Image));
+            var handleRect2 = handle.GetComponent<RectTransform>();
+            handleRect2.anchorMin = new Vector2(0, 0);
+            handleRect2.anchorMax = new Vector2(0, 1);
+            handleRect2.pivot = new Vector2(0.5f, 0.5f);
+            handleRect2.sizeDelta = new Vector2(20, 0);
+            var handleImg = handle.GetComponent<Image>();
+            handleImg.color = new Color(0.8f, 0.9f, 1f, 1);
+            handle.transform.SetParent(handleArea.transform, false);
+
+            sl.handleRect = handleRect2;
+            sl.fillRect = fillRect;
+            sl.targetGraphic = handleImg;
             sl.minValue = min;
             sl.maxValue = max;
             sl.value = currentValue;
+
+            // Layout: give the slider a minimum size
+            var le = go.AddComponent<LayoutElement>();
+            le.minWidth = 120;
+            le.minHeight = 24;
+            le.flexibleWidth = 1;
+
+            // Show value text if requested
+            var showValue = element.GetString("showValue");
+            if (showValue == "true")
+            {
+                var valGo = new GameObject("ValueText", typeof(Text));
+                var valText = valGo.GetComponent<Text>();
+                valText.font = DefaultFont;
+                valText.fontSize = 12;
+                valText.color = Color.white;
+                valText.alignment = TextAnchor.MiddleRight;
+                var valRect = valGo.GetComponent<RectTransform>();
+                valRect.anchorMin = Vector2.zero;
+                valRect.anchorMax = Vector2.one;
+                valRect.offsetMin = Vector2.zero;
+                valRect.offsetMax = Vector2.zero;
+                sl.onValueChanged.AddListener(v =>
+                {
+                    valText.text = v.ToString("F0");
+                });
+                valText.text = currentValue.ToString("F0");
+                valGo.transform.SetParent(go.transform, false);
+            }
 
             sl.onValueChanged.AddListener(val =>
             {

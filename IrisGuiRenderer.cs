@@ -859,41 +859,43 @@ namespace Iris.Iml
                 ScheduleEffect(() => InvokeHandler(onChanged, result.Value));
         }
 
-        private void RenderSlider(ImlElement element)
-        {
-            var valueBinding = element.GetExpression("value");
-            var minStr = element.GetString("min");
-            var maxStr = element.GetString("max");
-            var showValueStr = element.GetString("showValue");
-            var onChanged = element.GetString("on-changed");
+		private void RenderSlider(ImlElement element)
+		{
+			var valueBinding = element.GetExpression("value");
+			var minStr = element.GetString("min");
+			var maxStr = element.GetString("max");
+			var showValueStr = element.GetString("showValue");
+			var onChanged = element.GetString("on-changed");
 
-            float min = string.IsNullOrEmpty(minStr) ? 0 : float.Parse(minStr);
-            float max = string.IsNullOrEmpty(maxStr) ? 100 : float.Parse(maxStr);
-            bool showValue = showValueStr == "true";
+			float min = string.IsNullOrEmpty(minStr) ? 0 : float.Parse(minStr);
+			float max = string.IsNullOrEmpty(maxStr) ? 100 : float.Parse(maxStr);
+			bool showValue = showValueStr == "true";
 
-            float currentValue = min;
-            if (!string.IsNullOrEmpty(valueBinding))
-            {
-                var val = _evaluator.Evaluate(valueBinding);
-                currentValue = Convert.ToSingle(val);
-            }
+			float currentValue = min;
+			if (!string.IsNullOrEmpty(valueBinding))
+			{
+				var val = _evaluator.Evaluate(valueBinding);
+				currentValue = Convert.ToSingle(val);
+			}
 
-            GUI.changed = false;
-            GUILayout.BeginHorizontal(GUILayout.ExpandWidth(true), GUILayout.MaxWidth(200));
-            float newValue = GUILayout.HorizontalSlider(currentValue, min, max);
-            if (showValue)
-                GUILayout.Label(newValue.ToString("F2"), GUILayout.Width(50));
-            GUILayout.EndHorizontal();
+			GUI.changed = false;
+			float newValue = GUILayout.HorizontalSlider(currentValue, min, max, GUILayout.MinWidth(100));
+			if (showValue)
+			{
+				bool isInt = currentValue == Mathf.Round(currentValue) && max > 1;
+				var fmt = isInt ? "F0" : "F2";
+				GUILayout.Space(5);
+				GUILayout.Label(newValue.ToString(fmt), GUILayout.Width(50));
+			}
 
-            // Two-way binding: write the new value back to the data context
-            // BEFORE invoking the on-changed handler.
-            if (GUI.changed && !string.IsNullOrEmpty(valueBinding))
-                SetContextValue(valueBinding, newValue);
-            if (GUI.changed && !string.IsNullOrEmpty(onChanged))
-            {
-                ScheduleEffect(() => InvokeHandler(onChanged, newValue));
-            }
-        }
+			if (GUI.changed)
+			{
+				if (!string.IsNullOrEmpty(valueBinding))
+					SetContextValue(valueBinding, newValue);
+				if (!string.IsNullOrEmpty(onChanged))
+					ScheduleEffect(() => InvokeHandler(onChanged, newValue));
+			}
+		}
 
         private void RenderTextField(ImlElement element)
         {
