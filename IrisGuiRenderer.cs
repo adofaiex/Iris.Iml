@@ -878,14 +878,41 @@ namespace Iris.Iml
 				currentValue = Convert.ToSingle(val);
 			}
 
+			bool isInt = currentValue == Mathf.Round(currentValue) && max > 1;
+			var fmt = isInt ? "F0" : "F2";
+
 			GUI.changed = false;
-			float newValue = GUILayout.HorizontalSlider(currentValue, min, max, GUILayout.MinWidth(100));
+			float newValue = GUILayout.HorizontalSlider(currentValue, min, max, GUILayout.MinWidth(80));
 			if (showValue)
 			{
-				bool isInt = currentValue == Mathf.Round(currentValue) && max > 1;
-				var fmt = isInt ? "F0" : "F2";
 				GUILayout.Space(5);
-				GUILayout.Label(newValue.ToString(fmt), GUILayout.Width(50));
+				var textValue = newValue.ToString(fmt);
+				if (_layout != null)
+				{
+					var layoutResult = _layout.TextField(textValue);
+					if (layoutResult != null && float.TryParse(layoutResult, out var parsed))
+					{
+						parsed = Mathf.Clamp(parsed, min, max);
+						if (Math.Abs(parsed - newValue) > 0.001f)
+						{
+							newValue = parsed;
+							GUI.changed = true;
+						}
+					}
+				}
+				else
+				{
+					var guiResult = GUILayout.TextField(textValue, GUILayout.Width(50));
+					if (float.TryParse(guiResult, out var parsed))
+					{
+						parsed = Mathf.Clamp(parsed, min, max);
+						if (Math.Abs(parsed - newValue) > 0.001f)
+						{
+							newValue = parsed;
+							GUI.changed = true;
+						}
+					}
+				}
 			}
 
 			if (GUI.changed)
