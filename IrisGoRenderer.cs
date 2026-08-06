@@ -45,9 +45,37 @@ namespace Iris.Iml
             get
             {
                 if (_defaultFont == null)
-                    _defaultFont = Resources.GetBuiltinResource<Font>("Arial.ttf") ?? DefaultFont;
+                {
+                    _defaultFont = TryLoadCjkFont();
+                    if (_defaultFont == null)
+                        _defaultFont = Resources.GetBuiltinResource<Font>("Arial.ttf");
+                }
                 return _defaultFont;
             }
+        }
+
+        /// <summary>
+        /// Built-in fonts (Arial) have no CJK glyphs, so Chinese/Japanese/Korean
+        /// text renders blank in Text/TextField. Prefer a system CJK font when
+        /// one is available; fall back to the built-in font otherwise.
+        /// </summary>
+        private Font TryLoadCjkFont()
+        {
+            string[] candidates = {
+                "Noto Sans CJK SC", "Noto Sans CJK TC", "Noto Sans CJK JP", "Noto Sans CJK KR",
+                "WenQuanYi Micro Hei", "WenQuanYi Zen Hei", "Droid Sans Fallback",
+                "Microsoft YaHei", "PingFang SC", "Source Han Sans SC", "SimHei"
+            };
+            foreach (var name in candidates)
+            {
+                try
+                {
+                    var f = Font.CreateDynamicFontFromOSFont(name, 14);
+                    if (f != null) return f;
+                }
+                catch { }
+            }
+            return null;
         }
 
         // ---- Sprite cache ----
@@ -537,6 +565,14 @@ namespace Iris.Iml
                         leFill.flexibleHeight = 1;
                     }
                     fill.transform.SetParent(parent, false);
+                    break;
+
+                case "ArrowButton":
+                    BuildArrowButton(element, parent);
+                    break;
+
+                case "Selector":
+                    BuildSelector(element, parent);
                     break;
 
                 case "Reference":
@@ -1081,6 +1117,141 @@ namespace Iris.Iml
             txtGo.transform.SetParent(go.transform, false);
 
             go.transform.SetParent(parent, false);
+        }
+
+        private void BuildArrowButton(ImlElement element, Transform parent)
+        {
+            var dir = (element.GetString("direction") ?? "right").ToLowerInvariant();
+            var arrowChar = dir switch
+            {
+                "down" => "▼",
+                "left" => "◀",
+                "up" => "▲",
+                _ => "▶"
+            };
+
+            var go = new GameObject("ArrowButton");
+            var img = go.AddComponent<Image>();
+
+            var style = GetEffectiveStyle(element);
+            ApplyBackgroundStyle(img, style);
+            img.raycastTarget = true;
+
+            var le = go.AddComponent<LayoutElement>();
+            le.preferredWidth = 24;
+            le.preferredHeight = 24;
+            le.minWidth = 24;
+            le.minHeight = 24;
+
+            var btn = go.AddComponent<Button>();
+            btn.targetGraphic = img;
+            btn.onClick.AddListener(() => HandleElementEvents(element));
+
+            var txtGo = new GameObject("Arrow");
+            var txtRect = txtGo.AddComponent<RectTransform>();
+            txtRect.anchorMin = Vector2.zero;
+            txtRect.anchorMax = Vector2.one;
+            txtRect.offsetMin = Vector2.zero;
+            txtRect.offsetMax = Vector2.zero;
+            var txt = txtGo.AddComponent<Text>();
+            txt.text = arrowChar;
+            txt.alignment = TextAnchor.MiddleCenter;
+            txt.font = DefaultFont;
+            txt.fontSize = 14;
+            txt.color = Color.white;
+            txt.horizontalOverflow = HorizontalWrapMode.Overflow;
+            txt.verticalOverflow = VerticalWrapMode.Overflow;
+            txtGo.transform.SetParent(go.transform, false);
+
+            go.transform.SetParent(parent, false);
+        }
+
+        private void BuildSelector(ImlElement element, Transform parent)
+        {
+            var valueBinding = element.GetExpression("value");
+            var itemsStr = element.GetExpression("items");
+            var onChanged = element.GetString("on-changed");
+
+            if (string.IsNullOrEmpty(itemsStr)) return;
+            var itemsObj = _evaluator.Evaluate(itemsStr);
+            if (itemsObj is not IList items) return;
+
+            string currentStr = "";
+            if (!string.IsNullOrEmpty(valueBinding))
+            {
+                var val = _evaluator.Evaluate(valueBinding);
+                currentStr = val?.ToString() ?? "";
+            }
+
+            var container = new GameObject("Selector");
+            var hlg = container.AddComponent<HorizontalLayoutGroup>();
+            hlg.childForceExpandWidth = false;
+            hlg.childForceExpandHeight = true;
+            hlg.spacing = 4;
+
+            var csf = container.AddComponent<ContentSizeFitter>();
+            csf.horizontalFit = ContentSizeFitter.FitMode.PreferredSize;
+            csf.verticalFit = ContentSizeFitter.FitMode.PreferredSize;
+
+            container.transform.SetParent(parent, false);
+
+            for (int i = 0; i < items.Count; i++)
+            {
+                var item = items[i];
+                string key, display;
+
+                if (item is string s)
+                {
+                    key = s;
+                    display = s;
+                }
+                else if (item != null)
+                {
+                    var t = item.GetType();
+                    var keyProp = t.GetProperty("key");
+                    var displayProp = t.GetProperty("displayName");
+                    key = keyProp?.GetValue(item)?.ToString() ?? item.ToString();
+                    display = displayProp?.GetValue(item)?.ToString() ?? item.ToString();
+                }
+                else continue;
+
+                bool isSelected = key == currentStr;
+                var btnGo = new GameObject("Btn_" + key);
+                var img = btnGo.AddComponent<Image>();
+                img.color = isSelected ? new Color(0.85f, 0.45f, 0.65f) : new Color(0.19f, 0.20f, 0.22f);
+                img.raycastTarget = true;
+
+                var le = btnGo.AddComponent<LayoutElement>();
+                le.minHeight = 24;
+
+                var btn = btnGo.AddComponent<Button>();
+                btn.targetGraphic = img;
+                string capturedKey = key;
+                btn.onClick.AddListener(() =>
+                {
+                    if (!string.IsNullOrEmpty(valueBinding))
+                        SetContextValue(valueBinding, capturedKey);
+                    if (!string.IsNullOrEmpty(onChanged))
+                        ScheduleEffect(() => InvokeHandler(onChanged, capturedKey));
+                });
+
+                var txtGo = new GameObject("Text");
+                var txtRect = txtGo.AddComponent<RectTransform>();
+                txtRect.anchorMin = Vector2.zero;
+                txtRect.anchorMax = Vector2.one;
+                txtRect.offsetMin = new Vector2(6, 2);
+                txtRect.offsetMax = new Vector2(-6, -2);
+                var txt = txtGo.AddComponent<Text>();
+                txt.text = display;
+                txt.alignment = TextAnchor.MiddleCenter;
+                txt.font = DefaultFont;
+                txt.fontSize = 12;
+                txt.color = isSelected ? Color.white : new Color(0.91f, 0.93f, 0.94f);
+                txt.horizontalOverflow = HorizontalWrapMode.Overflow;
+                txtGo.transform.SetParent(btnGo.transform, false);
+
+                btnGo.transform.SetParent(container.transform, false);
+            }
         }
 
         private void BuildImage(ImlElement element, Transform parent)

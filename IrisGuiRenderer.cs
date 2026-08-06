@@ -39,6 +39,7 @@ namespace Iris.Iml
         private IIrrLayout _layout;
 
         private readonly Dictionary<string, Func<object[], object>> _registeredFunctions = new();
+        private readonly Dictionary<string, GUIStyle> _guiStyleCache = new();
 
         public void SetLayout(IIrrLayout layout) => _layout = layout;
 
@@ -247,9 +248,33 @@ namespace Iris.Iml
                 }
             }
 
+            // Resolve style inheritance (extends)
+            foreach (var kv in _styleCache)
+            {
+                ResolveExtends(kv.Value, new HashSet<string>());
+            }
+
             // Sort selectors by specificity ascending so GetEffectiveStyle can
             // apply them in order (later = higher specificity = wins).
             _selectorStyles.Sort((a, b) => a.Selector.Specificity.CompareTo(b.Selector.Specificity));
+        }
+
+        private void ResolveExtends(ImlStyle style, HashSet<string> visited)
+        {
+            if (string.IsNullOrEmpty(style.Extends)) return;
+            if (!visited.Add(style.Name.ToLowerInvariant()))
+            {
+                Debug.LogWarning($"[Iris.Iml] Circular style inheritance detected for '{style.Name}'");
+                return;
+            }
+            if (_styleCache.TryGetValue(style.Extends.ToLowerInvariant(), out var parent))
+            {
+                ResolveExtends(parent, visited);
+                foreach (var kv in parent.Setters)
+                    if (!style.Setters.ContainsKey(kv.Key))
+                        style.Setters[kv.Key] = kv.Value;
+            }
+            style.Extends = null;
         }
 
         private void ProcessReferencedFile(string path)
@@ -442,6 +467,14 @@ namespace Iris.Iml
                     RenderForEach(element);
                     break;
 
+                case "ArrowButton":
+                    RenderArrowButton(element);
+                    break;
+
+                case "Selector":
+                    RenderSelector(element);
+                    break;
+
                 case "CustomCanvas":
                     RenderCustomCanvas(element);
                     break;
@@ -506,17 +539,25 @@ namespace Iris.Iml
 
             if (_layout != null)
             {
+                var prevBg = GUI.backgroundColor;
+                if (style.Setters.TryGetValue("background", out var bgHex))
+                    GUI.backgroundColor = GetColor(bgHex);
+
                 if (isHorizontal)
                     _layout.BeginHorizontal(containerStyle, options.ToArray());
                 else
                     _layout.BeginVertical(containerStyle, options.ToArray());
+                GUI.backgroundColor = prevBg;
             }
             else
             {
+                var bgHex = GetStyleString(style, "background", "");
+                var gs = !string.IsNullOrEmpty(bgHex) ? BuildGuiStyle(style, element) : null;
+
                 if (isHorizontal)
-                    GUILayout.BeginHorizontal(options.ToArray());
+                    GUILayout.BeginHorizontal(gs ?? GUI.skin.box, options.ToArray());
                 else
-                    GUILayout.BeginVertical(options.ToArray());
+                    GUILayout.BeginVertical(gs ?? GUI.skin.box, options.ToArray());
             }
 
             try
@@ -654,26 +695,20 @@ namespace Iris.Iml
         private void RenderText(ImlElement element)
         {
             var text = ResolveAttributeValue(element, "text");
-            var useAttr = element.GetString("use");
-            var richTextAttr = element.GetString("richText");
-            bool richText = richTextAttr == "true";
+            var style = GetEffectiveStyle(element);
 
             if (_layout != null)
             {
-                // use/richText are for GameObject target; GUILayout ignores use, richText is handled by GUIStyle
+                var prevContent = GUI.contentColor;
+                if (style.Setters.TryGetValue("color", out var colorVal))
+                    GUI.contentColor = GetColor(colorVal);
                 _layout.Text(text, GetTextStyle(element));
+                GUI.contentColor = prevContent;
             }
             else
             {
-                var style = GetEffectiveStyle(element);
-                var guiStyle = new GUIStyle(GUI.skin.label);
-                guiStyle.richText = richText;
-                var prevBg = GUI.backgroundColor;
-                var prevContent = GUI.contentColor;
-                GUI.backgroundColor = Color.white;
-                GUI.contentColor = GetColor(style.Setters.TryGetValue("color", out var colorVal) ? colorVal : "#FFFFFF");
-                try { GUILayout.Label(text, guiStyle, GetStyleOptions(style)); }
-                finally { GUI.contentColor = prevContent; GUI.backgroundColor = prevBg; }
+                var gs = BuildTextStyle(style, element);
+                GUILayout.Label(text, gs, GetStyleOptions(style));
             }
         }
 
@@ -757,26 +792,31 @@ namespace Iris.Iml
         {
             var text = ResolveAttributeValue(element, "text");
             var command = element.GetString("command");
-            bool clicked = false;
+            var style = GetEffectiveStyle(element);
 
+            bool clicked;
             if (_layout != null)
-                clicked = _layout.Button(text, GetButtonStyle(element));
-            else
             {
-                var style = GetEffectiveStyle(element);
                 var prevBg = GUI.backgroundColor;
                 var prevContent = GUI.contentColor;
-                GUI.backgroundColor = GetColor(style.Setters.TryGetValue("background", out var bgVal) ? bgVal : "#333333");
-                GUI.contentColor = GetColor(style.Setters.TryGetValue("color", out var colorVal) ? colorVal : "#FFFFFF");
-                try { clicked = GUILayout.Button(text, GetStyleOptions(style)); }
-                finally { GUI.backgroundColor = prevBg; GUI.contentColor = prevContent; }
+                if (style.Setters.TryGetValue("background", out var bgVal))
+                    GUI.backgroundColor = GetColor(bgVal);
+                if (style.Setters.TryGetValue("color", out var colorVal))
+                    GUI.contentColor = GetColor(colorVal);
+                clicked = _layout.Button(text, GetButtonStyle(element));
+                GUI.backgroundColor = prevBg;
+                GUI.contentColor = prevContent;
+            }
+            else
+            {
+                var gs = BuildGuiStyle(style, element);
+                clicked = GUILayout.Button(text, gs, GetStyleOptions(style));
             }
 
             if (clicked)
             {
                 if (!string.IsNullOrEmpty(command))
                     InvokeCommand(command);
-
                 HandleElementEvents(element);
             }
         }
@@ -789,10 +829,15 @@ namespace Iris.Iml
 
             if (!string.IsNullOrEmpty(text))
             {
+                var style = GetEffectiveStyle(element);
+                var prevContent = GUI.contentColor;
+                if (style.Setters.TryGetValue("color", out var colorVal))
+                    GUI.contentColor = GetColor(colorVal);
                 if (_layout != null)
                     _layout.Text(text, IrrTextStyle.Normal);
                 else
                     GUILayout.Label(text);
+                GUI.contentColor = prevContent;
             }
 
             bool currentValue = false;
@@ -807,15 +852,28 @@ namespace Iris.Iml
                 result = _layout.Switch(currentValue);
             else
             {
+                var style = GetEffectiveStyle(element);
+                var onHex = GetStyleString(style, "switchOn", "#D973A5");
+                var offHex = GetStyleString(style, "switchOff", "#313338");
+                var knobHex = GetStyleString(style, "knobColor", "#FFFFFF");
+                Color onColor = GetColor(onHex);
+                Color offColor = GetColor(offHex);
+                Color knobColor = GetColor(knobHex);
+
+                int w = 40, h = 22;
+                var tex = GuiTextureFactory.GetPill(w, h,
+                    currentValue ? onColor : offColor,
+                    knobColor,
+                    currentValue ? 1f : 0f);
+                var gs = new GUIStyle();
+                gs.normal.background = gs.hover.background = gs.active.background = tex;
+                gs.border = new RectOffset(h / 2, h / 2, h / 2, h / 2);
+
                 GUI.changed = false;
-                bool newValue = GUILayout.Toggle(currentValue, "", GUILayout.Width(40), GUILayout.Height(20));
+                bool newValue = GUILayout.Toggle(currentValue, "", gs, GUILayout.Width(w), GUILayout.Height(h));
                 result = GUI.changed ? newValue : (bool?)null;
             }
 
-            // Two-way binding: write the new value back to the data context
-            // BEFORE invoking the on-changed handler, so handlers can also
-            // rely on the bound field being up-to-date (in addition to the
-            // explicit `value = obj` they receive in their handler body).
             if (result.HasValue && !string.IsNullOrEmpty(valueBinding))
                 SetContextValue(valueBinding, result.Value);
             if (result.HasValue && !string.IsNullOrEmpty(onChanged))
@@ -830,10 +888,15 @@ namespace Iris.Iml
 
             if (!string.IsNullOrEmpty(text))
             {
+                var style = GetEffectiveStyle(element);
+                var prevContent = GUI.contentColor;
+                if (style.Setters.TryGetValue("color", out var colorVal))
+                    GUI.contentColor = GetColor(colorVal);
                 if (_layout != null)
                     _layout.Text(text, IrrTextStyle.Normal);
                 else
                     GUILayout.Label(text);
+                GUI.contentColor = prevContent;
             }
 
             bool currentValue = false;
@@ -848,9 +911,41 @@ namespace Iris.Iml
                 result = _layout.Checkbox(currentValue);
             else
             {
-                GUI.changed = false;
-                bool newValue = GUILayout.Toggle(currentValue, "", GUILayout.Width(40), GUILayout.Height(20));
-                result = GUI.changed ? newValue : (bool?)null;
+                var style = GetEffectiveStyle(element);
+                var bgHex = GetStyleString(style, "background", "#313338");
+                var borderHex = GetStyleString(style, "borderColor", "#494F5C");
+                var checkHex = GetStyleString(style, "checkColor", "#FFFFFF");
+                var onBgHex = GetStyleString(style, "checkBg", "#D973A5");
+                Color bg = GetColor(bgHex);
+                Color borderCol = GetColor(borderHex);
+                Color check = GetColor(checkHex);
+                int sz = 22, radius = 4;
+
+                if (currentValue)
+                {
+                    var tex = GuiTextureFactory.GetRoundedRect(sz, sz, radius, GetColor(onBgHex), null, 0);
+                    var gs = new GUIStyle();
+                    gs.normal.background = gs.hover.background = gs.active.background = tex;
+                    gs.border = new RectOffset(radius, radius, radius, radius);
+                    GUI.changed = false;
+                    bool newValue = GUILayout.Toggle(true, "", gs, GUILayout.Width(sz), GUILayout.Height(sz));
+                    result = GUI.changed ? false : (bool?)null;
+
+                    // Overlay checkmark
+                    var chk = GuiTextureFactory.GetCheckmark(sz, check);
+                    var rect = GUILayoutUtility.GetLastRect();
+                    GUI.DrawTexture(rect, chk);
+                }
+                else
+                {
+                    var tex = GuiTextureFactory.GetRoundedRect(sz, sz, radius, bg, borderCol, 1);
+                    var gs = new GUIStyle();
+                    gs.normal.background = gs.hover.background = gs.active.background = tex;
+                    gs.border = new RectOffset(radius, radius, radius, radius);
+                    GUI.changed = false;
+                    bool newValue = GUILayout.Toggle(false, "", gs, GUILayout.Width(sz), GUILayout.Height(sz));
+                    result = GUI.changed ? true : (bool?)null;
+                }
             }
 
             if (result.HasValue && !string.IsNullOrEmpty(valueBinding))
@@ -939,21 +1034,49 @@ namespace Iris.Iml
             string newValue = null;
             if (_layout != null)
             {
+                var style = GetEffectiveStyle(element);
+                var prevBg = GUI.backgroundColor;
+                var prevContent = GUI.contentColor;
+                if (style.Setters.TryGetValue("background", out var bgHex))
+                    GUI.backgroundColor = GetColor(bgHex);
+                if (style.Setters.TryGetValue("color", out var colorHex))
+                    GUI.contentColor = GetColor(colorHex);
                 newValue = _layout.TextField(currentValue);
+                GUI.backgroundColor = prevBg;
+                GUI.contentColor = prevContent;
             }
             else
             {
+                var style = GetEffectiveStyle(element);
+                var bgHex = GetStyleString(style, "background", "#151719");
+                var borderHex = GetStyleString(style, "borderColor", "#222326");
+                var focusHex = GetStyleString(style, "focusBorder", "#D973A5");
+                var colorHex = GetStyleString(style, "color", "#E9ECEF");
+                int radius = GetStyleInt(style, "radius", 8);
+                int borderWidth = GetStyleInt(style, "borderWidth", 1);
+
+                Color bg = GetColor(bgHex);
+                Color borderCol = GetColor(borderHex);
+                Color focusCol = GetColor(focusHex);
+                int texSize = Mathf.Max(2 * radius + 2, 16);
+
+                var normalTex = GuiTextureFactory.GetRoundedRect(texSize, texSize, radius, bg, borderCol, borderWidth);
+                var focusTex = GuiTextureFactory.GetRoundedRect(texSize, texSize, radius, bg, focusCol, borderWidth);
+                var gs = new GUIStyle(GUI.skin.textField);
+                gs.normal.background = normalTex;
+                gs.hover.background = normalTex;
+                gs.active.background = focusTex;
+                gs.focused.background = focusTex;
+                gs.normal.textColor = gs.hover.textColor = gs.active.textColor = gs.focused.textColor = GetColor(colorHex);
+                gs.border = new RectOffset(radius, radius, radius, radius);
+                gs.padding = new RectOffset(6, 6, 4, 4);
+
                 GUI.changed = false;
-                newValue = GUILayout.TextField(currentValue, GUILayout.ExpandWidth(true));
+                newValue = GUILayout.TextField(currentValue, gs, GUILayout.ExpandWidth(true));
                 if (!GUI.changed)
                     newValue = null;
             }
 
-            // Two-way binding: write the new value back to the data context
-            // BEFORE invoking the user handler, so handlers like
-            // Settings.OnJudgeTextChanged (which only call Save()) actually
-            // have the new value to persist. Without this, the bound CLR
-            // field stays at its old value. (Bug: "判定文本无法修改".)
             if (newValue != null && !string.IsNullOrEmpty(valueBinding))
                 SetContextValue(valueBinding, newValue);
 
@@ -989,18 +1112,31 @@ namespace Iris.Iml
 
         private void RenderSeparator(ImlElement element)
         {
+            var style = GetEffectiveStyle(element);
+
             if (_layout != null)
-                _layout.Separator();
-            else
             {
-                GUILayout.Space(1);
-                var color = GetColor(element.GetString("color") ?? "#333333");
                 var prevBg = GUI.backgroundColor;
-                GUI.backgroundColor = color;
-                try { GUILayout.Box("", GUILayout.ExpandWidth(true), GUILayout.Height(1)); }
-                finally { GUI.backgroundColor = prevBg; }
-                GUILayout.Space(1);
+                if (style.Setters.TryGetValue("background", out var bgHex))
+                    GUI.backgroundColor = GetColor(bgHex);
+                _layout.Separator();
+                GUI.backgroundColor = prevBg;
+                return;
             }
+
+            var sepColor = GetStyleString(style, "background", "#20FFFFFF");
+            Color c = GetColor(sepColor);
+            int h = 1;
+            var tex = new Texture2D(2, h, TextureFormat.RGBA32, false);
+            tex.hideFlags = HideFlags.HideAndDontSave;
+            for (int x = 0; x < 2; x++)
+                tex.SetPixel(x, 0, c);
+            tex.Apply();
+            tex.wrapMode = TextureWrapMode.Repeat;
+
+            GUILayout.Space(2);
+            GUILayout.Box("", GUILayout.ExpandWidth(true), GUILayout.Height(h));
+            GUILayout.Space(2);
         }
 
         private void RenderForEach(ImlElement element)
@@ -1128,9 +1264,155 @@ namespace Iris.Iml
 
         private void RenderIcon(ImlElement element)
         {
-            if (_layout == null) return;
-            var iconStyle = GetIconStyle(element);
-            _layout.Icon(iconStyle);
+            var style = GetEffectiveStyle(element);
+
+            if (_layout != null)
+            {
+                var prevBg = GUI.backgroundColor;
+                var prevContent = GUI.contentColor;
+                if (style.Setters.TryGetValue("background", out var bgHex))
+                    GUI.backgroundColor = GetColor(bgHex);
+                if (style.Setters.TryGetValue("color", out var colorHex))
+                    GUI.contentColor = GetColor(colorHex);
+                _layout.Icon(GetIconStyle(element));
+                GUI.backgroundColor = prevBg;
+                GUI.contentColor = prevContent;
+                return;
+            }
+
+            var iconType = GetIconStyle(element);
+            int sz = 22;
+            int radius = sz / 2;
+            Color circleColor = GetColor(GetStyleString(style, "background", "#494F5C"));
+            Color borderColor = GetColor(GetStyleString(style, "borderColor", "#313338_Hovered"));
+            Color symbolColor = GetColor(GetStyleString(style, "color", "#FFFFFF"));
+
+            var circle = GuiTextureFactory.GetCircle(sz, circleColor, borderColor, 2);
+            var gs = new GUIStyle();
+            gs.normal.background = circle;
+            gs.fixedWidth = sz;
+            gs.fixedHeight = sz;
+
+            GUILayout.Box("", gs);
+            var rect = GUILayoutUtility.GetLastRect();
+
+            var symbolKind = iconType switch
+            {
+                IrrIconStyle.Information => GuiTextureFactory.IconSymbol.Information,
+                IrrIconStyle.Success => GuiTextureFactory.IconSymbol.Success,
+                IrrIconStyle.Warning => GuiTextureFactory.IconSymbol.Warning,
+                IrrIconStyle.Error => GuiTextureFactory.IconSymbol.Error,
+                IrrIconStyle.Stop => GuiTextureFactory.IconSymbol.Stop,
+                _ => GuiTextureFactory.IconSymbol.Information
+            };
+            var sym = GuiTextureFactory.GetIconSymbol(sz, symbolKind, symbolColor);
+            GUI.DrawTexture(rect, sym);
+        }
+
+        private void RenderArrowButton(ImlElement element)
+        {
+            var dirStr = element.GetString("direction") ?? "right";
+            var dir = dirStr.ToLowerInvariant() switch
+            {
+                "down" => GuiTextureFactory.ArrowDir.Down,
+                "left" => GuiTextureFactory.ArrowDir.Left,
+                "up" => GuiTextureFactory.ArrowDir.Up,
+                _ => GuiTextureFactory.ArrowDir.Right
+            };
+
+            var style = GetEffectiveStyle(element);
+            var bgHex = GetStyleString(style, "background", "#313338");
+            var borderHex = GetStyleString(style, "borderColor", "#494F5C");
+            var arrowHex = GetStyleString(style, "color", "#FFFFFF");
+            int sz = 22, radius = 4;
+
+            var tex = GuiTextureFactory.GetRoundedRect(sz, sz, radius, GetColor(bgHex), GetColor(borderHex), 1);
+            var gs = new GUIStyle();
+            gs.normal.background = gs.hover.background = gs.active.background = tex;
+            gs.border = new RectOffset(radius, radius, radius, radius);
+            gs.fixedWidth = sz;
+            gs.fixedHeight = sz;
+
+            bool clicked = GUILayout.Button("", gs);
+            var rect = GUILayoutUtility.GetLastRect();
+            var arr = GuiTextureFactory.GetArrow(sz, dir, GetColor(arrowHex));
+            GUI.DrawTexture(rect, arr);
+
+            if (clicked)
+                HandleElementEvents(element);
+        }
+
+        private void RenderSelector(ImlElement element)
+        {
+            var valueBinding = element.GetExpression("value");
+            var itemsStr = element.GetExpression("items");
+            var onChanged = element.GetString("on-changed");
+
+            if (string.IsNullOrEmpty(itemsStr)) return;
+
+            var itemsObj = _evaluator.Evaluate(itemsStr);
+            if (itemsObj is not IList items) return;
+
+            string currentStr = "";
+            if (!string.IsNullOrEmpty(valueBinding))
+            {
+                var val = _evaluator.Evaluate(valueBinding);
+                currentStr = val?.ToString() ?? "";
+            }
+
+            bool changed = false;
+            string newValue = currentStr;
+
+            var elementStyle = GetEffectiveStyle(element);
+            var selectedBg = GetStyleString(elementStyle, "selectedBg", "#D973A5");
+            var selectedColor = GetStyleString(elementStyle, "selectedColor", "#FFFFFF");
+            var unselectedBg = GetStyleString(elementStyle, "background", "#313338");
+            var unselectedColor = GetStyleString(elementStyle, "color", "#E9ECEF");
+
+            for (int i = 0; i < items.Count; i++)
+            {
+                var item = items[i];
+                string key = "";
+                string display = "";
+
+                if (item is string s)
+                {
+                    key = s;
+                    display = s;
+                }
+                else if (item != null)
+                {
+                    var t = item.GetType();
+                    var keyProp = t.GetProperty("key");
+                    var displayProp = t.GetProperty("displayName");
+                    key = keyProp?.GetValue(item)?.ToString() ?? item.ToString();
+                    display = displayProp?.GetValue(item)?.ToString() ?? item.ToString();
+                }
+
+                bool isSelected = key == currentStr;
+                var optStyle = new ImlStyle();
+                optStyle.Setters["background"] = isSelected ? selectedBg : unselectedBg;
+                optStyle.Setters["color"] = isSelected ? selectedColor : unselectedColor;
+                optStyle.Setters["radius"] = GetStyleString(elementStyle, "radius", "8");
+
+                var gs = BuildGuiStyle(optStyle, element);
+                if (GUILayout.Button(display, gs))
+                {
+                    if (!isSelected)
+                    {
+                        changed = true;
+                        newValue = key;
+                    }
+                }
+            }
+
+            if (changed)
+            {
+                if (!string.IsNullOrEmpty(valueBinding))
+                    SetContextValue(valueBinding, newValue);
+                if (!string.IsNullOrEmpty(onChanged))
+                    ScheduleEffect(() => InvokeHandler(onChanged, newValue));
+            }
         }
 
         private IrrIconStyle GetIconStyle(ImlElement element)
@@ -1313,15 +1595,115 @@ namespace Iris.Iml
             if (string.IsNullOrEmpty(hex))
                 return Color.white;
 
-            if (hex.StartsWith("#") && hex.Length == 7)
+            if (hex.StartsWith("#"))
             {
-                var r = Convert.ToByte(hex.Substring(1, 2), 16) / 255f;
-                var g = Convert.ToByte(hex.Substring(3, 2), 16) / 255f;
-                var b = Convert.ToByte(hex.Substring(5, 2), 16) / 255f;
-                return new Color(r, g, b);
+                hex = hex.Substring(1);
+                if (hex.Length >= 6)
+                {
+                    var r = Convert.ToByte(hex.Substring(0, 2), 16) / 255f;
+                    var g = Convert.ToByte(hex.Substring(2, 2), 16) / 255f;
+                    var b = Convert.ToByte(hex.Substring(4, 2), 16) / 255f;
+                    float a = hex.Length >= 8 ? Convert.ToByte(hex.Substring(6, 2), 16) / 255f : 1f;
+                    return new Color(r, g, b, a);
+                }
             }
 
             return Color.white;
+        }
+
+        private static Color MultiplyColor(Color c, float factor)
+        {
+            return new Color(c.r * factor, c.g * factor, c.b * factor, c.a);
+        }
+
+        private string GetStyleString(ImlStyle style, string key, string fallback = "")
+        {
+            return style.Setters.TryGetValue(key, out var v) ? v : fallback;
+        }
+
+        private int GetStyleInt(ImlStyle style, string key, int fallback = 0)
+        {
+            if (style.Setters.TryGetValue(key, out var v) && int.TryParse(v, out var n))
+                return n;
+            return fallback;
+        }
+
+        private float GetStyleFloat(ImlStyle style, string key, float fallback = 0f)
+        {
+            if (style.Setters.TryGetValue(key, out var v) && float.TryParse(v, out var n))
+                return n;
+            return fallback;
+        }
+
+        private GUIStyle BuildGuiStyle(ImlStyle style, ImlElement element)
+        {
+            string tag = element?.TagName?.ToLowerInvariant() ?? "";
+            string cls = element?.GetString("class")?.ToLowerInvariant() ?? "";
+
+            string bgHex = GetStyleString(style, "background", "");
+            string colorHex = GetStyleString(style, "color", "");
+            string borderHex = GetStyleString(style, "borderColor", "");
+            int radius = GetStyleInt(style, "radius");
+            int borderWidth = GetStyleInt(style, "borderWidth");
+            int fontSize = GetStyleInt(style, "fontSize");
+            int marginVal = GetStyleInt(style, "margin");
+            int paddingVal = GetStyleInt(style, "padding");
+
+            string cacheKey = $"{tag}.{cls}.bg:{bgHex}.cl:{colorHex}.bd:{borderHex}.r:{radius}.bw:{borderWidth}.fs:{fontSize}.m:{marginVal}.p:{paddingVal}";
+            if (_guiStyleCache.TryGetValue(cacheKey, out var cached))
+                return cached;
+
+            var gs = new GUIStyle();
+            gs.richText = true;
+            gs.wordWrap = true;
+            gs.clipping = TextClipping.Overflow;
+
+            if (fontSize > 0) gs.fontSize = fontSize;
+            if (!string.IsNullOrEmpty(colorHex)) gs.normal.textColor = GetColor(colorHex);
+
+            if (marginVal > 0) gs.margin = new RectOffset(marginVal, marginVal, marginVal, marginVal);
+            if (paddingVal > 0) gs.padding = new RectOffset(paddingVal, paddingVal, paddingVal, paddingVal);
+
+            if (!string.IsNullOrEmpty(bgHex))
+            {
+                Color bg = GetColor(bgHex);
+                int texSize = Mathf.Max(2 * radius + 2, 16);
+                Color? borderCol = !string.IsNullOrEmpty(borderHex) ? GetColor(borderHex) : null;
+
+                gs.normal.background = GuiTextureFactory.GetRoundedRect(texSize, texSize, radius, bg, borderCol, borderWidth);
+                gs.hover.background = GuiTextureFactory.GetRoundedRect(texSize, texSize, radius, MultiplyColor(bg, 1.08f), borderCol, borderWidth);
+                gs.active.background = GuiTextureFactory.GetRoundedRect(texSize, texSize, radius, MultiplyColor(bg, 0.88f), borderCol, borderWidth);
+
+                if (radius > 0)
+                    gs.border = new RectOffset(radius, radius, radius, radius);
+            }
+
+            _guiStyleCache[cacheKey] = gs;
+            return gs;
+        }
+
+        private GUIStyle BuildTextStyle(ImlStyle style, ImlElement element)
+        {
+            string tag = element?.TagName?.ToLowerInvariant() ?? "";
+            string cls = element?.GetString("class")?.ToLowerInvariant() ?? "";
+            string colorHex = GetStyleString(style, "color", "");
+            int fontSize = GetStyleInt(style, "fontSize");
+
+            string cacheKey = $"txt.{cls}.cl:{colorHex}.fs:{fontSize}";
+            if (_guiStyleCache.TryGetValue(cacheKey, out var cached))
+                return cached;
+
+            var gs = new GUIStyle();
+            gs.richText = true;
+            gs.wordWrap = true;
+            gs.clipping = TextClipping.Overflow;
+            gs.alignment = TextAnchor.MiddleLeft;
+
+            if (fontSize > 0) gs.fontSize = fontSize;
+            if (!string.IsNullOrEmpty(colorHex)) gs.normal.textColor = GetColor(colorHex);
+
+            _guiStyleCache[cacheKey] = gs;
+            return gs;
         }
 
         private Texture2D LoadTexture(string path)
@@ -1374,7 +1756,7 @@ namespace Iris.Iml
         public string Name { get; set; }
         public string Extends { get; set; }
         public StyleSelector Selector { get; set; }
-        public Dictionary<string, string> Setters { get; } = new();
+        public Dictionary<string, string> Setters { get; set; } = new();
     }
 
     namespace RendererInternal
