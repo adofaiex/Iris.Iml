@@ -679,7 +679,7 @@ namespace Iris.Iml
 
             if (path.StartsWith("@/"))
             {
-                // Mod root: go up from ui/ to Resources/ to frontline/ to Iridium/
+                // Mod root: go up from ui/ to Resources/ to v3/ to Iridium/
                 // Actually, @/ resolves relative to the mod root (Main.ModPath)
                 // For now, resolve relative to basePath + ../../
                 return Path.GetFullPath(Path.Combine(basePath, "..", "..", path.Substring(2)));
