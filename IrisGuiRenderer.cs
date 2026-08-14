@@ -1311,7 +1311,8 @@ namespace Iris.Iml
 
         private void RenderArrowButton(ImlElement element)
         {
-            var dirStr = element.GetString("direction") ?? "right";
+            var dirStr = ResolveAttributeValue(element, "direction");
+            if (string.IsNullOrEmpty(dirStr)) dirStr = "right";
             var dir = dirStr.ToLowerInvariant() switch
             {
                 "down" => GuiTextureFactory.ArrowDir.Down,
@@ -1333,7 +1334,7 @@ namespace Iris.Iml
             gs.fixedWidth = sz;
             gs.fixedHeight = sz;
 
-            bool clicked = GUILayout.Button("", gs);
+            bool clicked = GUILayout.Button("", gs, GUILayout.Width(sz), GUILayout.Height(sz));
             var rect = GUILayoutUtility.GetLastRect();
             var arr = GuiTextureFactory.GetArrow(sz, dir, GetColor(arrowHex));
             GUI.DrawTexture(rect, arr);

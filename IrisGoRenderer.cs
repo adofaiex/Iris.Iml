@@ -651,6 +651,24 @@ namespace Iris.Iml
 
             var style = GetEffectiveStyle(element);
 
+            // fixed width / height (from inline attribute, supports {expr})
+            var wStr = element.HasAttribute("width") ? ResolveAttributeValue(element, "width") : "";
+            var hStr = element.HasAttribute("height") ? ResolveAttributeValue(element, "height") : "";
+            if (!string.IsNullOrEmpty(wStr) || !string.IsNullOrEmpty(hStr))
+            {
+                var le = go.AddComponent<LayoutElement>();
+                if (float.TryParse(wStr, out var w) && w > 0)
+                {
+                    le.preferredWidth = w;
+                    le.minWidth = w;
+                }
+                if (float.TryParse(hStr, out var h) && h > 0)
+                {
+                    le.preferredHeight = h;
+                    le.minHeight = h;
+                }
+            }
+
             // gap (from inline or style)
             var gapStr = element.GetString("gap");
             if (string.IsNullOrEmpty(gapStr)) style?.Setters?.TryGetValue("gap", out gapStr);

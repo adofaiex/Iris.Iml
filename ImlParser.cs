@@ -548,8 +548,24 @@ namespace Iris.Iml
         {
             if (Tag != null && !string.Equals(Tag, elementTag, StringComparison.OrdinalIgnoreCase))
                 return false;
-            if (Class != null && !string.Equals(Class, elementClass, StringComparison.OrdinalIgnoreCase))
-                return false;
+            if (Class != null)
+            {
+                // Elements may carry multiple classes ("dialog bg-default"); a class
+                // selector matches if the element's class list contains this one.
+                if (string.IsNullOrEmpty(elementClass))
+                    return false;
+                var classes = elementClass.Split(new[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
+                bool hit = false;
+                foreach (var c in classes)
+                {
+                    if (string.Equals(c, Class, StringComparison.OrdinalIgnoreCase))
+                    {
+                        hit = true;
+                        break;
+                    }
+                }
+                if (!hit) return false;
+            }
             if (Id != null && !string.Equals(Id, elementId, StringComparison.OrdinalIgnoreCase))
                 return false;
             return true;

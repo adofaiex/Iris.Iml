@@ -261,15 +261,19 @@ namespace Iris.Iml
             Color transparent = new(0, 0, 0, 0);
             float s = size;
             float cx = s / 2, cy = s / 2;
-            float arm = s * 0.3f;
-            float halfW = s * 0.15f;
+            // Equilateral triangle: base half-width hw and arm such that all three
+            // sides are equal. arm = hw * sqrt(3).
+            float hw = s * 0.22f;
+            float arm = hw * 1.732f;
 
             Vector2[] arrowPts = dir switch
             {
-                ArrowDir.Right => new[] { new Vector2(cx - arm, cy - halfW), new Vector2(cx + arm, cy), new Vector2(cx - arm, cy + halfW) },
-                ArrowDir.Left => new[] { new Vector2(cx + arm, cy - halfW), new Vector2(cx - arm, cy), new Vector2(cx + arm, cy + halfW) },
-                ArrowDir.Down => new[] { new Vector2(cx - halfW, cy - arm), new Vector2(cx, cy + arm), new Vector2(cx + halfW, cy - arm) },
-                ArrowDir.Up => new[] { new Vector2(cx - halfW, cy + arm), new Vector2(cx, cy - arm), new Vector2(cx + halfW, cy + arm) },
+                ArrowDir.Right => new[] { new Vector2(cx - arm, cy - hw), new Vector2(cx + arm, cy), new Vector2(cx - arm, cy + hw) },
+                ArrowDir.Left => new[] { new Vector2(cx + arm, cy - hw), new Vector2(cx - arm, cy), new Vector2(cx + arm, cy + hw) },
+                // Unity Texture2D origin is bottom-left (y grows upward), so the
+                // "down" apex must sit at the smaller y (bottom).
+                ArrowDir.Down => new[] { new Vector2(cx - hw, cy + arm), new Vector2(cx, cy - arm), new Vector2(cx + hw, cy + arm) },
+                ArrowDir.Up => new[] { new Vector2(cx - hw, cy - arm), new Vector2(cx, cy + arm), new Vector2(cx + hw, cy - arm) },
                 _ => null
             };
 
@@ -280,10 +284,16 @@ namespace Iris.Iml
                 for (int x = 0; x < size; x++)
                 {
                     Vector2 p = new(x + 0.5f, y + 0.5f);
+                    bool inside = PointInTriangle(p, arrowPts[0], arrowPts[1], arrowPts[2]);
+                    // Anti-alias the edges by checking distance to the three sides.
                     float d = PointToLineDist(p, arrowPts[0], arrowPts[1]);
                     d = Mathf.Min(d, PointToLineDist(p, arrowPts[1], arrowPts[2]));
                     d = Mathf.Min(d, PointToLineDist(p, arrowPts[0], arrowPts[2]));
-                    float alpha = Mathf.Clamp01(-d + 1.5f);
+                    float alpha;
+                    if (inside)
+                        alpha = Mathf.Clamp01(d + 1.2f); // solid fill, smooth edge
+                    else
+                        alpha = 0f;
                     if (alpha < 0.003f)
                         tex.SetPixel(x, y, transparent);
                     else
@@ -375,6 +385,17 @@ namespace Iris.Iml
             t = Mathf.Clamp01(t);
             Vector2 closest = a + t * ab;
             return (p - closest).magnitude;
+        }
+
+        private static bool PointInTriangle(Vector2 p, Vector2 a, Vector2 b, Vector2 c)
+        {
+            float sign(Vector2 p1, Vector2 p2, Vector2 p3) => (p1.x - p3.x) * (p2.y - p3.y) - (p2.x - p3.x) * (p1.y - p3.y);
+            float d1 = sign(p, a, b);
+            float d2 = sign(p, b, c);
+            float d3 = sign(p, c, a);
+            bool hasNeg = d1 < 0 || d2 < 0 || d3 < 0;
+            bool hasPos = d1 > 0 || d2 > 0 || d3 > 0;
+            return !(hasNeg && hasPos);
         }
 
         // Symbol distance fields
