@@ -1,10 +1,14 @@
 using System;
 using System.Collections;
 using System.Collections.Generic;
+using System.Drawing.Drawing2D;
+using System.Drawing.Imaging;
 using System.IO;
 using System.Linq;
+using System.Runtime.InteropServices;
 using UnityEngine;
 using UnityEngine.UI;
+using SD = System.Drawing;
 
 namespace Iris.Iml
 {
@@ -85,6 +89,7 @@ namespace Iris.Iml
         // procedurally generated rounded-corner sprite per radius (for 9-slice corners).
         private static Sprite _flatSprite;
         private static readonly Dictionary<int, Sprite> _roundedSpriteCache = new();
+        private static readonly Dictionary<string, Sprite> _iconSpriteCache = new();
 
         private static Sprite FlatSprite
         {
@@ -166,6 +171,371 @@ namespace Iris.Iml
             sprite.hideFlags = HideFlags.HideAndDontSave;
             _roundedSpriteCache[radius] = sprite;
             return sprite;
+        }
+
+        // ---- Icon rendering ----
+        // Icons are rasterized with the exact same System.Drawing pipeline that
+        // IridiumLayout uses (see v2/UI/IridiumLayout.cs RenderCircleGlyph + Draw*):
+        // an anti-aliased colored disc with a darker border ring and a white vector
+        // symbol, rows flipped to match Unity's texture orientation. This keeps the
+        // icons pixel-identical and correctly oriented instead of the old flat disc
+        // with an Arial font glyph on top.
+        private static Sprite GetIconSprite(string style)
+        {
+            if (_iconSpriteCache.TryGetValue(style, out var cached)) return cached;
+
+            // Palette from IridiumLayout's Resolution icon set.
+            (Color fill, Color border) = style switch
+            {
+                "information" => (new Color(0x49 / 255f, 0x4F / 255f, 0x5C / 255f), new Color(0x37 / 255f, 0x39 / 255f, 0x3F / 255f)),
+                "success"     => (new Color(0x03 / 255f, 0x98 / 255f, 0x55 / 255f), new Color(0x02 / 255f, 0x79 / 255f, 0x48 / 255f)),
+                "warning"     => (new Color(0xF7 / 255f, 0x90 / 255f, 0x09 / 255f), new Color(0xDC / 255f, 0x68 / 255f, 0x03 / 255f)),
+                "error"       => (new Color(0xD9 / 255f, 0x20 / 255f, 0x20 / 255f), new Color(0xB4 / 255f, 0x18 / 255f, 0x18 / 255f)),
+                "stop"        => (new Color(0xD9 / 255f, 0x20 / 255f, 0x20 / 255f), new Color(0xB4 / 255f, 0x18 / 255f, 0x18 / 255f)),
+                _             => (new Color(0x49 / 255f, 0x4F / 255f, 0x5C / 255f), new Color(0x37 / 255f, 0x39 / 255f, 0x3F / 255f)),
+            };
+            var stroke = new Color(0xF8 / 255f, 0xF9 / 255f, 0xFA / 255f); // IridiumLayout TitleTextColors
+
+            // Render at 2x the layout size (24px) for crisp downscaling by the UI.
+            const int size = 48;
+            var texture = RenderIconTexture(size, size, graphics =>
+                RenderCircleGlyph(graphics, size, fill, border, stroke, style));
+            texture.name = $"IrisIcon_{style}";
+            texture.hideFlags = HideFlags.HideAndDontSave;
+            texture.filterMode = FilterMode.Bilinear;
+            texture.wrapMode = TextureWrapMode.Clamp;
+
+            var sprite = Sprite.Create(
+                texture,
+                new Rect(0, 0, size, size),
+                new Vector2(0.5f, 0.5f),
+                100f, 0, SpriteMeshType.FullRect);
+            sprite.name = $"IrisIcon_{style}";
+            sprite.hideFlags = HideFlags.HideAndDontSave;
+            _iconSpriteCache[style] = sprite;
+            return sprite;
+        }
+
+        private static void RenderCircleGlyph(
+            SD.Graphics graphics,
+            int size,
+            Color color,
+            Color borderColor,
+            Color strokeColor,
+            string style
+        )
+        {
+            var border = size * 2 / 20F;
+            {
+                using var path = new GraphicsPath();
+                path.AddArc(0, 0, size, size, 0, 360);
+                path.CloseFigure();
+                using var brush = new SD.SolidBrush(DrawingColor(borderColor));
+                graphics.FillPath(brush, path);
+            }
+            {
+                using var path = new GraphicsPath();
+                path.AddArc(border, border, size - border - border, size - border - border, 0, 360);
+                path.CloseFigure();
+                using var brush = new SD.SolidBrush(DrawingColor(color));
+                graphics.FillPath(brush, path);
+            }
+
+            switch (style)
+            {
+                case "information": DrawInformation(graphics, size, strokeColor); break;
+                case "success": DrawSuccess(graphics, size, strokeColor); break;
+                case "warning": DrawWarning(graphics, size, strokeColor); break;
+                case "error": DrawError(graphics, size, strokeColor); break;
+                case "stop": DrawStop(graphics, size, strokeColor); break;
+            }
+        }
+
+        private static Texture2D RenderIconTexture(int width, int height, Action<SD.Graphics> renderer)
+        {
+            Color[] pixels;
+            var stride = width * 4;
+
+            byte[] rawBytes;
+            {
+                using var bitmap = new SD.Bitmap(width, height, PixelFormat.Format32bppArgb);
+                using var graphics = SD.Graphics.FromImage(bitmap);
+                graphics.SmoothingMode = SmoothingMode.AntiAlias;
+                graphics.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                graphics.PixelOffsetMode = PixelOffsetMode.HighQuality;
+                graphics.Clear(SD.Color.Transparent);
+                renderer(graphics);
+                var rect = new SD.Rectangle(0, 0, width, height);
+                var bitmapData = bitmap.LockBits(rect, ImageLockMode.ReadOnly, bitmap.PixelFormat);
+                rawBytes = new byte[Math.Abs(bitmapData.Stride) * bitmap.Height];
+                Marshal.Copy(bitmapData.Scan0, rawBytes, 0, rawBytes.Length);
+                bitmap.UnlockBits(bitmapData);
+                stride = Math.Abs(bitmapData.Stride);
+            }
+
+            pixels = new Color[width * height];
+            for (var row = 0; row < height; row++)
+            {
+                // Flip rows so the texture's top row maps to Unity's top (y = height).
+                var sourceRow = (height - 1 - row) * stride;
+                for (var col = 0; col < width; col++)
+                {
+                    var source = sourceRow + col * 4;
+                    pixels[row * width + col] = new Color(
+                        rawBytes[source + 2] / 255F,
+                        rawBytes[source + 1] / 255F,
+                        rawBytes[source] / 255F,
+                        rawBytes[source + 3] / 255F
+                    );
+                }
+            }
+
+            var texture = new Texture2D(width, height, TextureFormat.ARGB32, false);
+            texture.SetPixels(pixels);
+            texture.Apply(false, true);
+            return texture;
+        }
+
+        private static SD.Color DrawingColor(Color color)
+        {
+            return SD.Color.FromArgb(
+                (int)(color.a * 255),
+                (int)(color.r * 255),
+                (int)(color.g * 255),
+                (int)(color.b * 255)
+            );
+        }
+
+        private static SD.Pen StrokePen(int size, Color strokeColor, float thickness)
+        {
+            var pen = new SD.Pen(DrawingColor(strokeColor), size * thickness / 20F);
+            pen.StartCap = LineCap.Round;
+            pen.EndCap = LineCap.Round;
+            pen.LineJoin = LineJoin.Round;
+            return pen;
+        }
+
+        private static void FillDot(SD.Graphics graphics, float x, float y, float diameter, Color strokeColor)
+        {
+            using var path = new GraphicsPath();
+            path.AddArc(x, y, diameter, diameter, 0, 360);
+            path.CloseFigure();
+            using var brush = new SD.SolidBrush(DrawingColor(strokeColor));
+            graphics.FillPath(brush, path);
+        }
+
+        private static void DrawRingWithStem(SD.Graphics graphics, int size, Color strokeColor, float stemTop, float stemBottom)
+        {
+            using var path = new GraphicsPath();
+            path.AddArc(size * 4 / 20F, size * 4 / 20F, size * 12 / 20F, size * 12 / 20F, 0, 360);
+            path.StartFigure();
+            path.AddLine(size * 10 / 20F, size * stemTop / 20F, size * 10 / 20F, size * stemBottom / 20F);
+            using var pen = StrokePen(size, strokeColor, 1.5F);
+            graphics.DrawPath(pen, path);
+        }
+
+        private static void DrawInformation(SD.Graphics graphics, int size, Color strokeColor)
+        {
+            DrawRingWithStem(graphics, size, strokeColor, 9.5F, 13F);
+            FillDot(graphics, size * 9.25F / 20F, size * 6.25F / 20F, size * 1.5F / 20F, strokeColor);
+        }
+
+        private static void DrawSuccess(SD.Graphics graphics, int size, Color strokeColor)
+        {
+            using var path = new GraphicsPath();
+            path.AddArc(size * 4 / 20F, size * 4 / 20F, size * 12 / 20F, size * 12 / 20F, 0, 285);
+            path.StartFigure();
+            path.AddLines([
+                new SD.PointF(size * 8 / 20F, size * 9F / 20F),
+                new SD.PointF(size * 10 / 20F, size * 11F / 20F),
+                new SD.PointF(size * 16 / 20F, size * 5F / 20F)
+            ]);
+            using var pen = StrokePen(size, strokeColor, 1.5F);
+            graphics.DrawPath(pen, path);
+        }
+
+        private static void DrawWarning(SD.Graphics graphics, int size, Color strokeColor)
+        {
+            using var path = new GraphicsPath();
+            AppendRoundedPolyline(
+                path,
+                size * 2 / 20F,
+                true,
+                PolarPoint(size, 30, 9),
+                PolarPoint(size, 150, 9),
+                PolarPoint(size, 270, 9)
+            );
+            path.CloseFigure();
+            path.AddLine(size * 10 / 20F, size * 7 / 20F, size * 10 / 20F, size * 10.5F / 20F);
+            using var pen = StrokePen(size, strokeColor, 1.5F);
+            graphics.DrawPath(pen, path);
+
+            FillDot(graphics, size * 9.25F / 20F, size * 12.25F / 20F, size * 1.5F / 20F, strokeColor);
+        }
+
+        private static void DrawError(SD.Graphics graphics, int size, Color strokeColor)
+        {
+            DrawRingWithStem(graphics, size, strokeColor, 7F, 10.5F);
+            FillDot(graphics, size * 9.25F / 20F, size * 12.25F / 20F, size * 1.5F / 20F, strokeColor);
+        }
+
+        private static SD.PointF PolarPoint(int size, double angleDegrees, double distance)
+        {
+            return new SD.PointF(
+                (float)(size * (10 + distance * Math.Cos(angleDegrees / 180 * Math.PI)) / 20),
+                (float)(size * (11 + distance * Math.Sin(angleDegrees / 180 * Math.PI)) / 20)
+            );
+        }
+
+        private static void DrawStop(SD.Graphics graphics, int size, Color strokeColor)
+        {
+            using var path = new GraphicsPath();
+            var inset = size * 4.5F / 20F;
+            var block = size * 11F / 20F;
+            path.AddRectangle(new SD.RectangleF(inset, inset, block, block));
+            using var brush = new SD.SolidBrush(DrawingColor(strokeColor));
+            graphics.FillPath(brush, path);
+        }
+
+        private static void AppendRoundedPolyline(
+            GraphicsPath path,
+            double radius,
+            bool close,
+            params SD.PointF[] points
+        )
+        {
+            var count = points.Length;
+
+            if (count <= 1) return;
+
+            if (count == 2)
+            {
+                path.AddLine(points[0], points[1]);
+                return;
+            }
+
+            radius = Math.Max(radius, 0);
+
+            List<double> segmentLengths = [];
+
+            for (var i = 0; i < count; i++)
+            {
+                var from = points[i];
+                var to = points[i + 1 == count ? 0 : i + 1];
+                var dx = to.X - from.X;
+                var dy = to.Y - from.Y;
+                segmentLengths.Add(Math.Sqrt(dx * dx + dy * dy));
+            }
+
+            List<double> cornerRadii = [];
+
+            for (var i = 1; i < count - 1; i++)
+                cornerRadii.Add(Math.Min(radius, Math.Min(segmentLengths[i - 1] / 2, segmentLengths[i] / 2)));
+
+            if (close)
+            {
+                cornerRadii.Add(Math.Min(radius, Math.Min(segmentLengths[count - 2] / 2, segmentLengths[count - 1] / 2)));
+                cornerRadii.Add(Math.Min(radius, Math.Min(segmentLengths[count - 1] / 2, segmentLengths[0] / 2)));
+            }
+            else
+            {
+                cornerRadii[0] = Math.Min(radius, Math.Min(segmentLengths[0], segmentLengths[1] / 2));
+                cornerRadii[cornerRadii.Count - 1] = Math.Min(
+                    radius,
+                    Math.Min(segmentLengths[count - 3] / 2, segmentLengths[count - 2])
+                );
+                var leadLength = segmentLengths[0] - CornerProjection(
+                    cornerRadii[0],
+                    points[0].X,
+                    points[0].Y,
+                    points[1].X,
+                    points[1].Y,
+                    points[2].X,
+                    points[2].Y
+                );
+                var leadX = (points[1].X - points[0].X) * leadLength / segmentLengths[0];
+                var leadY = (points[1].Y - points[0].Y) * leadLength / segmentLengths[0];
+                path.AddLine(points[0], points[0] + new SD.SizeF((float)leadX, (float)leadY));
+            }
+
+            for (var i = 0; i < cornerRadii.Count; i++)
+            {
+                var cornerRadius = cornerRadii[i];
+                var p1 = points[i];
+                var p2 = points[i + 1 >= count ? i + 1 - count : i + 1];
+                var p3 = points[i + 2 >= count ? i + 2 - count : i + 2];
+                AppendCornerArc(path, cornerRadius, p1.X, p1.Y, p2.X, p2.Y, p3.X, p3.Y);
+            }
+
+            if (close) path.CloseFigure();
+            else path.AddLine(path.GetLastPoint(), points[count - 1]);
+        }
+
+        private static void AppendCornerArc(
+            GraphicsPath path,
+            double radius,
+            double xA,
+            double yA,
+            double xC,
+            double yC,
+            double xB,
+            double yB
+        )
+        {
+            var dx1 = xA - xC;
+            var dy1 = yA - yC;
+            var dx2 = xB - xC;
+            var dy2 = yB - yC;
+            var len1 = Math.Sqrt(dx1 * dx1 + dy1 * dy1);
+            var len2 = Math.Sqrt(dx2 * dx2 + dy2 * dy2);
+            dx1 /= len1;
+            dy1 /= len1;
+            dx2 /= len2;
+            dy2 /= len2;
+            var dot = dx1 * dx2 + dy1 * dy2;
+            var startAngle = (Math.Atan2(dy1, dx1) * 180 / Math.PI % 360 + 360) % 360;
+            var endAngle = (Math.Atan2(dy2, dx2) * 180 / Math.PI % 360 + 360) % 360;
+            if (startAngle > endAngle) (startAngle, endAngle) = (endAngle, startAngle);
+            if (endAngle - startAngle > 180) (startAngle, endAngle) = (endAngle, startAngle + 360);
+
+            var scale = radius / Math.Sqrt(1 - dot * dot);
+            var centerX = xC + (dx1 + dx2) * scale;
+            var centerY = yC + (dy1 + dy2) * scale;
+
+            path.AddArc(
+                (float)(centerX - radius),
+                (float)(centerY - radius),
+                (float)(radius + radius),
+                (float)(radius + radius),
+                (float)(endAngle + 90),
+                (float)(startAngle - endAngle + 180)
+            );
+        }
+
+        private static double CornerProjection(
+            double radius,
+            double xA,
+            double yA,
+            double xC,
+            double yC,
+            double xB,
+            double yB
+        )
+        {
+            var dx1 = xA - xC;
+            var dy1 = yA - yC;
+            var dx2 = xB - xC;
+            var dy2 = yB - yC;
+            var len1 = Math.Sqrt(dx1 * dx1 + dy1 * dy1);
+            var len2 = Math.Sqrt(dx2 * dx2 + dy2 * dy2);
+            dx1 /= len1;
+            dy1 /= len1;
+            dx2 /= len2;
+            dy2 /= len2;
+            var dot = dx1 * dx2 + dy1 * dy2;
+            var sx = dx1 + dx2;
+            var sy = dy1 + dy2;
+            return radius * Math.Sqrt((sx * sx + sy * sy) / (2 - dot - dot));
         }
 
         /// <summary>Apply background color + sprite to a freshly created Image, reading radius from the style.</summary>
@@ -1088,27 +1458,14 @@ namespace Iris.Iml
             // return "" and the icon would always fall through to the default (gray "?").
             // Use ResolveAttributeValue so expressions are evaluated against the data context.
             var typeAttr = ResolveAttributeValue(element, "type");
-
-            // Color + symbol map matching IridiumLayout's icon set
-            var (color, symbol) = typeAttr switch
-            {
-                "information" => (new Color(0.3f, 0.5f, 1f),       "i"),
-                "success"      => (new Color(0.1f, 0.8f, 0.3f),     "✓"),
-                "warning"      => (new Color(0.9f, 0.6f, 0.1f),     "!"),
-                "error"        => (new Color(0.85f, 0.15f, 0.15f),  "✕"),
-                "stop"         => (new Color(0.85f, 0.15f, 0.15f),  "■"),
-                _              => (new Color(0.5f, 0.5f, 0.5f),     "?"),
-            };
+            var style = NormalizeIconType(typeAttr);
 
             const float iconSize = 24f;
             var go = new GameObject("Icon");
             var img = go.AddComponent<Image>();
-            img.color = color;
+            img.sprite = GetIconSprite(style);
+            img.type = Image.Type.Simple;
             img.raycastTarget = false;
-            // Use a full-circle sprite (radius == half size) to match IridiumLayout's
-            // circular icons rather than a rounded square.
-            img.sprite = GetRoundedSprite((int)(iconSize / 2f));
-            img.type = Image.Type.Sliced;
 
             var le = go.AddComponent<LayoutElement>();
             le.preferredWidth = iconSize;
@@ -1116,25 +1473,20 @@ namespace Iris.Iml
             le.minWidth = iconSize;
             le.minHeight = iconSize;
 
-            // Symbol overlay — child Text stretched to fill the icon
-            var txtGo = new GameObject("Symbol");
-            var txtRect = txtGo.AddComponent<RectTransform>();
-            txtRect.anchorMin = Vector2.zero;
-            txtRect.anchorMax = Vector2.one;
-            txtRect.offsetMin = Vector2.zero;
-            txtRect.offsetMax = Vector2.zero;
-            var txt = txtGo.AddComponent<Text>();
-            txt.text = symbol;
-            txt.alignment = TextAnchor.MiddleCenter;
-            txt.font = DefaultFont;
-            txt.fontSize = 14;
-            txt.color = Color.white;
-            txt.fontStyle = FontStyle.Bold;
-            txt.horizontalOverflow = HorizontalWrapMode.Overflow;
-            txt.verticalOverflow = VerticalWrapMode.Overflow;
-            txtGo.transform.SetParent(go.transform, false);
-
             go.transform.SetParent(parent, false);
+        }
+
+private static string NormalizeIconType(string typeAttr)
+        {
+            return typeAttr?.ToLowerInvariant() switch
+            {
+                "information" or "info" or "informational" or "i" => "information",
+                "success" or "succes" or "check" or "ok" => "success",
+                "warning" or "warn" or "!" => "warning",
+                "error" or "err" or "fail" or "x" => "error",
+                "stop" or "block" or "square" => "stop",
+                _ => "information",
+            };
         }
 
         private void BuildArrowButton(ImlElement element, Transform parent)

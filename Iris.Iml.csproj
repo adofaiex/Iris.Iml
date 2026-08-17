@@ -29,6 +29,7 @@
 			<HintPath>..\..\lib\ModManager\0Harmony.dll</HintPath>
 			<Private>false</Private>
 		</Reference>
+		<Reference Include="System.Drawing" />
 		<Reference Include="Assembly-CSharp">
 			<HintPath>..\..\lib\v2.9.8\Assembly-CSharp.dll</HintPath>
 			<Private>false</Private>
