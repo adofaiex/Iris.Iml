@@ -1237,6 +1237,7 @@ namespace Iris.Iml
                 "title" => IrrTextStyle.Title,
                 "subtitle" => IrrTextStyle.Subtitle,
                 "secondary" => IrrTextStyle.Secondary,
+                "hint" => IrrTextStyle.Secondary,
                 _ => IrrTextStyle.Normal
             };
         }
@@ -1274,9 +1275,11 @@ namespace Iris.Iml
                     GUI.backgroundColor = GetColor(bgHex);
                 if (style.Setters.TryGetValue("color", out var colorHex))
                     GUI.contentColor = GetColor(colorHex);
-                _layout.Icon(GetIconStyle(element));
+                bool clicked = _layout.Icon(GetIconStyle(element));
                 GUI.backgroundColor = prevBg;
                 GUI.contentColor = prevContent;
+                if (clicked)
+                    HandleElementEvents(element);
                 return;
             }
 
