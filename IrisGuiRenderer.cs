@@ -1330,6 +1330,23 @@ namespace Iris.Iml
             var arrowHex = GetStyleString(style, "color", "#FFFFFF");
             int sz = 22, radius = 4;
 
+            // 优先使用宿主注入的单纹理合成（背景+边框+箭头烘焙在一张图上，
+            // 一次绘制），避免两层 DrawTexture 叠加在半像素对齐时产生渗色。
+            if (GuiTextureFactory.TryGetExternalArrowButton(
+                    sz, dir, GetColor(bgHex), GetColor(borderHex), 1, radius, GetColor(arrowHex),
+                    out var composedTex))
+            {
+                var single = new GUIStyle();
+                single.normal.background = single.hover.background = single.active.background = composedTex;
+                single.border = new RectOffset(radius, radius, radius, radius);
+                single.fixedWidth = sz;
+                single.fixedHeight = sz;
+
+                if (GUILayout.Button("", single, GUILayout.Width(sz), GUILayout.Height(sz)))
+                    HandleElementEvents(element);
+                return;
+            }
+
             var tex = GuiTextureFactory.GetRoundedRect(sz, sz, radius, GetColor(bgHex), GetColor(borderHex), 1);
             var gs = new GUIStyle();
             gs.normal.background = gs.hover.background = gs.active.background = tex;

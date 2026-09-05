@@ -7,6 +7,39 @@ namespace Iris.Iml
     {
         private static readonly Dictionary<string, Texture2D> _cache = new();
 
+        /// <summary>
+        /// 可选的外部箭头纹理提供者（由宿主注入，参数: size, dir, stroke）。
+        /// 注入后 <see cref="GetArrow"/> 优先使用它，内置逐像素绘制不再执行。
+        /// </summary>
+        public static System.Func<int, int, Color, Texture2D>? ExternalArrowRenderer;
+
+        /// <summary>
+        /// 可选的外部“箭头按钮”合成纹理提供者（背景+边框+箭头烘焙为单张纹理，
+        /// 避免 GUI 里两次 DrawTexture 叠加）。参数: size, dir, fill, border,
+        /// borderWidth, radius, stroke。返回 null 表示外部不提供。
+        /// </summary>
+        public static System.Func<int, int, Color, Color, int, int, Color, Texture2D>? ExternalArrowButtonRenderer;
+
+        public static bool TryGetExternalArrowButton(int size, ArrowDir dir, Color fill, Color border,
+            int borderWidth, int radius, Color stroke, out Texture2D tex)
+        {
+            if (ExternalArrowButtonRenderer == null)
+            {
+                tex = null;
+                return false;
+            }
+            var key = Key("arrbtn", size, size, (int)dir, fill, border, borderWidth) + $"_{radius}_{stroke.ToHex()}";
+            if (_cache.TryGetValue(key, out var cached) && cached != null)
+            {
+                tex = cached;
+                return true;
+            }
+            tex = ExternalArrowButtonRenderer(size, (int)dir, fill, border, borderWidth, radius, stroke);
+            if (tex == null) return false;
+            _cache[key] = tex;
+            return true;
+        }
+
         public static void ClearCache()
         {
             foreach (var tex in _cache.Values)
@@ -249,10 +282,19 @@ namespace Iris.Iml
         public static Texture2D GetArrow(int size, ArrowDir dir, Color stroke)
         {
             var key = Key("arr", size, size, (int)dir, stroke, null, 0);
-            if (_cache.TryGetValue(key, out var tex) && tex != null)
-                return tex;
+            if (_cache.TryGetValue(key, out var cached) && cached != null)
+                return cached;
 
-            tex = new Texture2D(size, size, TextureFormat.RGBA32, false)
+            var tex = ExternalArrowRenderer != null
+                ? ExternalArrowRenderer(size, (int)dir, stroke)
+                : RenderBuiltinArrow(size, dir, stroke);
+            _cache[key] = tex;
+            return tex;
+        }
+
+        private static Texture2D RenderBuiltinArrow(int size, ArrowDir dir, Color stroke)
+        {
+            var tex = new Texture2D(size, size, TextureFormat.RGBA32, false)
             {
                 hideFlags = HideFlags.HideAndDontSave,
                 wrapMode = TextureWrapMode.Clamp
@@ -306,7 +348,6 @@ namespace Iris.Iml
             }
 
             tex.Apply();
-            _cache[key] = tex;
             return tex;
         }
 
