@@ -416,6 +416,10 @@ namespace Iris.Iml
                     RenderText(element);
                     break;
 
+                case "Link":
+                    RenderLink(element);
+                    break;
+
                 case "Image":
                     RenderImage(element);
                     break;
@@ -764,6 +768,29 @@ namespace Iris.Iml
                     return "";
                 default:
                     return attr.StringValue ?? "";
+            }
+        }
+
+        /// <summary>
+        /// 超链接组件：渲染为下划线链接文字，点击后打开 url 属性指向的地址。
+        /// </summary>
+        private void RenderLink(ImlElement element)
+        {
+            var text = ResolveAttributeValue(element, "text");
+            var url = element.GetString("url");
+            if (string.IsNullOrEmpty(text) || string.IsNullOrEmpty(url)) return;
+
+            if (_layout != null)
+            {
+                _layout.Link(text, url);
+            }
+            else
+            {
+                var gs = new GUIStyle(GUI.skin.label) { richText = true };
+                gs.normal.textColor = new Color(0.851f, 0.451f, 0.647f);
+                gs.hover.textColor = Color.white;
+                if (GUILayout.Button(new GUIContent($"<u>{text}</u>"), gs))
+                    Application.OpenURL(url);
             }
         }
 

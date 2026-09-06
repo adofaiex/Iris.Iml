@@ -21,5 +21,10 @@ namespace Iris.Iml
         void Fill();
         string? TextField(string content);
         bool Icon(IrrIconStyle style);
+
+        /// <summary>
+        /// 超链接文字（下划线+主题色）。点击后由实现方负责打开 <paramref name="url"/>。
+        /// </summary>
+        void Link(string text, string url);
     }
 }
