@@ -14,7 +14,6 @@ namespace Iris.Iml
         void RegisterFunction(string name, Func<object[], object> func);
         void RegisterDrawHandler(string name, Action<Rect, RendererInternal.DrawArgs> handler);
         void SetHotReload(bool enabled);
-        void SetLayout(IIrrLayout layout);
         void LoadFile(string filePath);
         void LoadContent(string imlContent, string basePath = "");
         void Render(string filePath);

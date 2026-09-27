@@ -1,1817 +1,942 @@
 using System;
-using System.Collections;
 using System.Collections.Generic;
-using System.IO;
-using System.Linq;
 using UnityEngine;
 
 namespace Iris.Iml
 {
     /// <summary>
-    /// IML渲染器主类
+    /// IMGUI backend. Each frame it builds the shared <see cref="ImlNode"/>
+    /// tree via <see cref="ImlRuntime"/>, runs the shared <see cref="LayoutEngine"/>
+    /// against the ambient available width, then draws at the produced rects.
+    /// All interaction (hover/press/pseudo classes) is resolved in draw space.
     /// </summary>
     public class IrisGuiRenderer : IImlRenderer
     {
-        private readonly ImlParser _parser = new();
-        private ImlDocument _document;
-        private IBindingContext _dataContext;
-        private ExpressionEvaluator _evaluator;
-        private readonly Dictionary<string, Action> _handlers = new();
-        private readonly Dictionary<string, Action<object>> _genericHandlers = new();
-        private readonly Dictionary<string, Action<Rect, RendererInternal.DrawArgs>> _drawHandlers = new();
-        private readonly Dictionary<string, Texture2D> _textureCache = new();
-        private readonly Dictionary<string, ImlStyle> _styleCache = new();
-        private readonly List<ImlStyle> _selectorStyles = new();
+        private readonly ImlRuntime _rt = new() { DeferEffects = true };
 
-        private bool _hotReloadEnabled = false;
-        private FileSystemWatcher _fileWatcher;
-        private float _lastReloadTime = 0f;
-        private const float ReloadCooldown = 0.5f;
+        private readonly Dictionary<string, GUIStyle> _boxStyles = new();
+        private readonly Dictionary<string, GUIStyle> _textStyles = new();
+        private readonly Dictionary<string, GUIStyle> _measureStyles = new();
+        private readonly Dictionary<string, GUIStyle> _buttonStyles = new();
+        private readonly Dictionary<string, GUIStyle> _fieldStyles = new();
 
-        private readonly List<Action> _pendingEffects = new();
-        private bool _effectsScheduled = false;
+        private float _scrollGrabOffset;
 
-        private readonly Dictionary<string, object> _loopItemContext = new();
-        private readonly Dictionary<string, List<object>> _forEachCollections = new();
+        // ── IImlRenderer ────────────────────────────────────────────────────
 
-        public string CurrentFilePath { get; private set; }
+        public string CurrentFilePath => _rt.CurrentFilePath;
 
-        private IIrrLayout _layout;
-
-        private readonly Dictionary<string, Func<object[], object>> _registeredFunctions = new();
-        private readonly Dictionary<string, GUIStyle> _guiStyleCache = new();
-
-        public void SetLayout(IIrrLayout layout) => _layout = layout;
-
-        /// <summary>
-        /// 日志输出委托，由调用方设置（如 Main.Logger.Log）
-        /// </summary>
-        public Action<string> LogDelegate { get; set; }
-
-        private void Log(string message)
+        public Action<string> LogDelegate
         {
-            // 优先使用委托，否则使用 Unity Debug.Log（会同时输出到 Unity Console 和 UMM 日志）
-            if (LogDelegate != null)
-                LogDelegate(message);
-            else
-                UnityEngine.Debug.Log($"[Iris.Iml] {message}");
+            get => _rt.LogDelegate;
+            set => _rt.LogDelegate = value;
         }
 
-        /// <summary>
-        /// 设置数据上下文
-        /// </summary>
-        public void SetDataContext(object data)
-        {
-            _dataContext = new BindingContext(data);
-            _evaluator = new ExpressionEvaluator(_dataContext as BindingContext ?? new BindingContext(data));
-            _dataContext.PropertyChanged += OnDataContextPropertyChanged;
+        public void SetDataContext(object data) => _rt.SetDataContext(data);
 
-            // Re-register functions on the new evaluator
-            foreach (var kv in _registeredFunctions)
-                _evaluator.RegisterFunction(kv.Key, kv.Value);
-        }
-
-        /// <summary>
-        /// Write a value back to the data context at the given property path.
-        /// Used by input controls (TextField, TextArea) when the user submits a
-        /// new value via the on-text-submit/on-changed handler chain. Without
-        /// this, the bound CLR field (e.g. <c>Settings.judgeText.tooEarly</c>)
-        /// stays at its old value, and downstream <c>Save()</c> writes the
-        /// stale value to disk. (Bug: "判定文本无法修改".)
-        /// </summary>
         public void SetContextValue(string propertyPath, object value)
-        {
-            _dataContext?.SetValue(propertyPath, value);
-        }
+            => _rt.SetContextValue(propertyPath, value);
 
-        /// <summary>
-        /// 注册事件处理程序
-        /// </summary>
         public void RegisterHandler(string name, Action handler)
-        {
-            _handlers[name] = handler;
-        }
-
-        public void RegisterHandler<T>(string name, Action<T> handler)
-        {
-            _genericHandlers[name] = obj => handler(obj is T t ? t : default);
-        }
+            => _rt.RegisterHandler(name, handler);
 
         public void RegisterHandler(string name, Action<object> handler)
-        {
-            _genericHandlers[name] = handler;
-        }
+            => _rt.RegisterHandler(name, handler);
+
+        public void RegisterHandler<T>(string name, Action<T> handler)
+            => _rt.RegisterHandler(name, handler);
 
         public void RegisterFunction(string name, Func<object[], object> func)
-        {
-            _registeredFunctions[name] = func;
-            _evaluator?.RegisterFunction(name, func);
-        }
+            => _rt.RegisterFunction(name, func);
 
-        /// <summary>
-        /// 注册绘制回调
-        /// </summary>
         public void RegisterDrawHandler(string name, Action<Rect, RendererInternal.DrawArgs> handler)
-        {
-            _drawHandlers[name] = handler;
-        }
+            => _rt.RegisterDrawHandler(name, handler);
 
-        /// <summary>
-        /// 启用/禁用热重载
-        /// </summary>
-        public void SetHotReload(bool enabled)
-        {
-            _hotReloadEnabled = enabled;
+        public void SetHotReload(bool enabled) => _rt.SetHotReload(enabled);
 
-            if (enabled && !string.IsNullOrEmpty(CurrentFilePath))
-            {
-                StartFileWatcher();
-            }
-            else
-            {
-                StopFileWatcher();
-            }
-        }
+        public void LoadFile(string filePath) => _rt.LoadFile(filePath);
 
-        private void StartFileWatcher()
-        {
-            StopFileWatcher();
-
-            var directory = Path.GetDirectoryName(CurrentFilePath);
-            var fileName = Path.GetFileName(CurrentFilePath);
-
-            if (Directory.Exists(directory))
-            {
-                _fileWatcher = new FileSystemWatcher(directory, fileName);
-                _fileWatcher.Changed += OnFileChanged;
-                _fileWatcher.EnableRaisingEvents = true;
-            }
-        }
-
-        private void StopFileWatcher()
-        {
-            if (_fileWatcher != null)
-            {
-                _fileWatcher.EnableRaisingEvents = false;
-                _fileWatcher.Changed -= OnFileChanged;
-                _fileWatcher.Dispose();
-                _fileWatcher = null;
-            }
-        }
-
-        private void OnFileChanged(object sender, FileSystemEventArgs e)
-        {
-            if (Time.realtimeSinceStartup - _lastReloadTime > ReloadCooldown)
-            {
-                _lastReloadTime = Time.realtimeSinceStartup;
-                LoadFile(CurrentFilePath);
-            }
-        }
-
-        /// <summary>
-        /// 加载IML文件
-        /// </summary>
-        public void LoadFile(string filePath)
-        {
-            CurrentFilePath = filePath;
-            _document = _parser.Parse(filePath);
-            ProcessResources();
-            _styleCache.Clear();
-            _selectorStyles.Clear();
-            _forEachCollections.Clear();
-            _referenceCache.Clear();
-
-            if (_hotReloadEnabled)
-                StartFileWatcher();
-        }
-
-        /// <summary>
-        /// 加载IML内容
-        /// </summary>
         public void LoadContent(string imlContent, string basePath = "")
-        {
-            _document = _parser.ParseContent(imlContent, basePath);
-            CurrentFilePath = string.IsNullOrEmpty(basePath) ? CurrentFilePath : Path.Combine(basePath, "_generated.iml");
-            ProcessResources();
-            _styleCache.Clear();
-            _selectorStyles.Clear();
-            _forEachCollections.Clear();
-            _referenceCache.Clear();
-        }
+            => _rt.LoadContent(imlContent, basePath);
 
-        private void ProcessResources()
-        {
-            if (_document?.Root == null) return;
-
-            // Process <Resources> section
-            foreach (var child in _document.Root.Children)
-            {
-                if (child is ImlElement element && element.TagName == "Resources")
-                {
-                    ProcessResourceElement(element);
-                }
-            }
-        }
-
-        private void ProcessReferencedResources(ImlDocument doc)
-        {
-            if (doc?.Root == null) return;
-            foreach (var child in doc.Root.Children)
-            {
-                if (child is ImlElement element && element.TagName == "Resources")
-                {
-                    ProcessResourceElement(element);
-                }
-            }
-        }
-
-        private void ProcessResourceElement(ImlElement element)
-        {
-            foreach (var child in element.Children)
-            {
-                if (child is ImlElement childElement)
-                {
-                    if (childElement.TagName == "Reference")
-                    {
-                        var path = childElement.GetString("path");
-                        if (!string.IsNullOrEmpty(path))
-                            ProcessReferencedFile(path);
-                    }
-                    else if (childElement.TagName == "Style")
-                    {
-                        var style = ParseStyle(childElement);
-                        if (!string.IsNullOrEmpty(style.Name))
-                            _styleCache[style.Name.ToLowerInvariant()] = style;
-                        if (style.Selector != null)
-                            _selectorStyles.Add(style);
-                    }
-                }
-            }
-
-            // Resolve style inheritance (extends)
-            foreach (var kv in _styleCache)
-            {
-                ResolveExtends(kv.Value, new HashSet<string>());
-            }
-
-            // Sort selectors by specificity ascending so GetEffectiveStyle can
-            // apply them in order (later = higher specificity = wins).
-            _selectorStyles.Sort((a, b) => a.Selector.Specificity.CompareTo(b.Selector.Specificity));
-        }
-
-        private void ResolveExtends(ImlStyle style, HashSet<string> visited)
-        {
-            if (string.IsNullOrEmpty(style.Extends)) return;
-            if (!visited.Add(style.Name.ToLowerInvariant()))
-            {
-                Debug.LogWarning($"[Iris.Iml] Circular style inheritance detected for '{style.Name}'");
-                return;
-            }
-            if (_styleCache.TryGetValue(style.Extends.ToLowerInvariant(), out var parent))
-            {
-                ResolveExtends(parent, visited);
-                foreach (var kv in parent.Setters)
-                    if (!style.Setters.ContainsKey(kv.Key))
-                        style.Setters[kv.Key] = kv.Value;
-            }
-            style.Extends = null;
-        }
-
-        private void ProcessReferencedFile(string path)
-        {
-            try
-            {
-                var refPath = ResolveReferencePath(path);
-                if (!File.Exists(refPath)) return;
-                if (_referenceCache.ContainsKey(refPath)) return;
-                var refDoc = _parser.Parse(refPath);
-                _referenceCache[refPath] = refDoc;
-                ProcessReferencedResources(refDoc);
-            }
-            catch (Exception ex)
-            {
-                Debug.LogWarning($"[Iris.Iml] Failed to process referenced resources: {path} - {ex.Message}");
-            }
-        }
-
-        private ImlStyle ParseStyle(ImlElement element)
-        {
-            var style = new ImlStyle
-            {
-                Name = element.GetString("name"),
-                Extends = element.GetString("extends"),
-                Selector = StyleSelector.Parse(element.GetString("on"))
-            };
-
-            foreach (var child in element.Children)
-            {
-                if (child is ImlElement childElement)
-                {
-                    if (childElement.TagName == "Setter")
-                    {
-                        var property = childElement.GetString("property");
-                        var value = childElement.GetString("value");
-                        if (!string.IsNullOrEmpty(property))
-                            style.Setters[property] = value ?? "";
-                    }
-                    else
-                    {
-                        // Custom property tag: <tagName value="..." />
-                        var value = childElement.GetString("value");
-                        if (!string.IsNullOrEmpty(value))
-                            style.Setters[childElement.TagName] = value;
-                    }
-                }
-            }
-
-            return style;
-        }
-
-        /// <summary>
-        /// 在OnGUI中调用此方法渲染UI
-        /// </summary>
-        public void OnGUI()
-        {
-            if (_document?.Root == null || _dataContext == null)
-                return;
-
-            if (_hotReloadEnabled && UnityEngine.Input.GetKeyDown(KeyCode.R) && UnityEngine.Input.GetKey(KeyCode.LeftControl))
-                LoadFile(CurrentFilePath);
-
-            var sw = new System.Diagnostics.Stopwatch();
-            sw.Start();
-            _elementCount = 0;
-
-            try
-            {
-                RenderElement(_document.Root);
-            }
-            catch (Exception ex)
-            {
-                Debug.LogError($"[Iris.Iml] Render error: {ex.Message}\n{ex.StackTrace}");
-            }
-
-            sw.Stop();
-
-            if (_effectsScheduled)
-            {
-                ProcessPendingEffects();
-                _effectsScheduled = false;
-            }
-        }
-
-        private int _elementCount;
-
-        /// <summary>
-        /// 加载并渲染IML文件（简化接口）
-        /// </summary>
         public void Render(string filePath)
         {
-            if (!string.Equals(CurrentFilePath, filePath, StringComparison.OrdinalIgnoreCase))
-                LoadFile(filePath);
+            if (!string.Equals(_rt.CurrentFilePath, filePath, StringComparison.Ordinal))
+                _rt.LoadFile(filePath);
             OnGUI();
         }
 
-        private void RenderElement(ImlElement element)
+        // ── frame ───────────────────────────────────────────────────────────
+
+        public void OnGUI()
         {
-            if (element == null) return;
-            _elementCount++;
+            if (_rt.Document?.Root == null || _rt.DataContext == null) return;
 
-            // Check condition (If rendering)
-            if (element.TagName == "If")
+            var evt = Event.current;
+            if (evt != null && evt.type == EventType.KeyDown && evt.keyCode == KeyCode.R &&
+                (evt.control || evt.command) && _rt.HotReloadEnabled)
             {
-                var condition = element.GetExpression("condition");
-                if (!string.IsNullOrEmpty(condition) && !_evaluator.EvaluateBoolean(condition))
-                    return;
+                _rt.RequestReload();
+                evt.Use();
             }
 
-            // Check visible attribute
-            if (element.HasAttribute("visible"))
-            {
-                var visible = element.GetExpression("visible");
-                if (!string.IsNullOrEmpty(visible) && !_evaluator.EvaluateBoolean(visible))
-                    return;
-            }
-
-            // Render based on tag type
-            switch (element.TagName)
-            {
-                case "Iris":
-                case "If":
-                case "":
-                    RenderChildren(element);
-                    break;
-
-                case "View":
-                case "HBox":
-                case "VBox":
-                    RenderFlexContainer(element);
-                    break;
-
-                case "ScrollView":
-                    RenderScrollView(element);
-                    break;
-
-                case "Text":
-                    RenderText(element);
-                    break;
-
-                case "Link":
-                    RenderLink(element);
-                    break;
-
-                case "Image":
-                    RenderImage(element);
-                    break;
-
-                case "Button":
-                    RenderButton(element);
-                    break;
-
-                case "Switch":
-                    RenderSwitch(element);
-                    break;
-
-                case "Checkbox":
-                    RenderCheckbox(element);
-                    break;
-
-                case "Slider":
-                    RenderSlider(element);
-                    break;
-
-                case "TextField":
-                    RenderTextField(element);
-                    break;
-
-                case "TextArea":
-                    RenderTextArea(element);
-                    break;
-
-                case "Fill":
-                    if (_layout != null)
-                        _layout.Fill();
-                    else
-                        GUILayout.FlexibleSpace();
-                    break;
-
-                case "Icon":
-                    RenderIcon(element);
-                    break;
-
-                case "Separator":
-                    RenderSeparator(element);
-                    break;
-
-                case "Reference":
-                    RenderReference(element);
-                    break;
-
-                case "ForEach":
-                    RenderForEach(element);
-                    break;
-
-                case "ArrowButton":
-                    RenderArrowButton(element);
-                    break;
-
-                case "Selector":
-                    RenderSelector(element);
-                    break;
-
-                case "CustomCanvas":
-                    RenderCustomCanvas(element);
-                    break;
-
-                case "References":
-                case "Resources":
-                case "Style":
-                case "Template":
-                case "StyleSelector":
-                case "Case":
-                case "Slot":
-                    // These are processed at load time
-                    break;
-
-                default:
-                    Debug.LogWarning($"[Iris.Iml] Unknown element: {element.TagName}");
-                    break;
-            }
-        }
-
-        private void RenderChildren(ImlElement element)
-        {
-            foreach (var child in element.Children)
-            {
-                if (child is ImlElement childElement)
-                    RenderElement(childElement);
-                else if (child is ExpressionValue ev && !string.IsNullOrWhiteSpace(ev.Expression))
-                {
-                    var evaluated = _evaluator.Evaluate(ev.Expression);
-                    var text = evaluated?.ToString() ?? "";
-                    if (_layout != null)
-                        _layout.Text(text, IrrTextStyle.Normal);
-                    else
-                        GUILayout.Label(text);
-                }
-                else if (child is string text && !string.IsNullOrWhiteSpace(text))
-                {
-                    if (_layout != null)
-                        _layout.Text(text, IrrTextStyle.Normal);
-                    else
-                        GUILayout.Label(text);
-                }
-            }
-        }
-
-        private void RenderFlexContainer(ImlElement element)
-        {
-            bool isHorizontal = element.TagName == "HBox";
-            var containerStyle = GetContainerStyle(element);
-            var style = GetEffectiveStyle(element);
-
-            var gapStr = element.GetString("gap");
-            int gap = 0;
-            if (!string.IsNullOrEmpty(gapStr) && int.TryParse(gapStr, out var g))
-                gap = g;
-
-            var options = new List<GUILayoutOption>();
-            options.AddRange(GetStyleOptions(style));
-            options.Add(GUILayout.ExpandWidth(true));
-            if (!isHorizontal)
-                options.Add(GUILayout.ExpandHeight(true));
-
-            if (_layout != null)
-            {
-                var prevBg = GUI.backgroundColor;
-                if (style.Setters.TryGetValue("background", out var bgHex))
-                    GUI.backgroundColor = GetColor(bgHex);
-
-                if (isHorizontal)
-                    _layout.BeginHorizontal(containerStyle, options.ToArray());
-                else
-                    _layout.BeginVertical(containerStyle, options.ToArray());
-                GUI.backgroundColor = prevBg;
-            }
-            else
-            {
-                var bgHex = GetStyleString(style, "background", "");
-                var gs = !string.IsNullOrEmpty(bgHex) ? BuildGuiStyle(style, element) : null;
-
-                if (isHorizontal)
-                    GUILayout.BeginHorizontal(gs ?? GUI.skin.box, options.ToArray());
-                else
-                    GUILayout.BeginVertical(gs ?? GUI.skin.box, options.ToArray());
-            }
-
+            ImlNode root;
             try
             {
-                var children = element.Children;
-                for (int i = 0; i < children.Length; i++)
-                {
-                    if (i > 0 && gap > 0)
-                    {
-                        if (_layout != null)
-                            _layout.Space(gap);
-                        else
-                            GUILayout.Space(gap);
-                    }
-
-                    if (children[i] is ImlElement childElement)
-                        RenderElement(childElement);
-                    else
-                    {
-                        var text = GetFlexChildText(children[i]);
-                        if (!string.IsNullOrEmpty(text))
-                        {
-                            if (_layout != null)
-                                _layout.Text(text, IrrTextStyle.Normal);
-                            else
-                                GUILayout.Label(text);
-                        }
-                    }
-                }
-            }
-            finally
-            {
-                if (_layout != null)
-                    _layout.End();
-                else if (isHorizontal)
-                    GUILayout.EndHorizontal();
-                else
-                    GUILayout.EndVertical();
-            }
-        }
-
-        private void RenderScrollView(ImlElement element)
-        {
-            var scrollPositionKey = element.GetString("scrollPosition") ?? "_scrollPos";
-
-            if (!_loopItemContext.TryGetValue(scrollPositionKey, out var posObj))
-            {
-                posObj = Vector2.zero;
-                _loopItemContext[scrollPositionKey] = posObj;
-            }
-
-            Vector2 scrollPos = (Vector2)posObj;
-            var heightStr = element.GetString("height");
-            int height = 0;
-            var options = new List<GUILayoutOption>();
-            options.Add(GUILayout.ExpandWidth(true));
-            options.Add(GUILayout.ExpandHeight(true));
-            if (!string.IsNullOrEmpty(heightStr) && int.TryParse(heightStr, out height))
-                options.Add(GUILayout.Height(height));
-            scrollPos = GUILayout.BeginScrollView(scrollPos, options.ToArray());
-
-            try
-            {
-                RenderChildren(element);
-            }
-            finally
-            {
-                GUILayout.EndScrollView();
-            }
-
-            _loopItemContext[scrollPositionKey] = scrollPos;
-        }
-
-        private readonly Dictionary<string, ImlDocument> _referenceCache = new();
-
-        private void RenderReference(ImlElement element)
-        {
-            // Per spec: use "path" attribute with @ prefix
-            var path = element.GetString("path");
-            if (string.IsNullOrEmpty(path))
-                path = element.GetString("src"); // backward compat
-            if (string.IsNullOrEmpty(path))
-                return;
-
-            try
-            {
-                var referencePath = ResolveReferencePath(path);
-
-                if (!File.Exists(referencePath))
-                {
-                    Debug.LogWarning($"[Iris.Iml] Reference file not found: {referencePath}");
-                    return;
-                }
-
-                // Cache parsed documents to avoid re-parsing every frame
-                if (!_referenceCache.TryGetValue(referencePath, out var referenceDocument))
-                {
-                    referenceDocument = _parser.Parse(referencePath);
-                    _referenceCache[referencePath] = referenceDocument;
-                    // Process resources (styles, templates) from referenced files
-                    ProcessReferencedResources(referenceDocument);
-                }
-
-                if (referenceDocument?.Root != null)
-                {
-                    RenderElement(referenceDocument.Root);
-                }
+                root = _rt.BuildTree();
             }
             catch (Exception ex)
             {
-                Debug.LogError($"[Iris.Iml] Failed to render reference: {path} - {ex.Message}");
+                Debug.LogError($"[Iris.Iml] Build failed: {ex}");
+                return;
             }
+            if (root == null) return;
+
+            float avail = ProbeWidth();
+            try
+            {
+                LayoutEngine.Layout(root, new LayoutConstraints
+                {
+                    AvailWidth = avail,
+                    AvailHeight = 0f,
+                    RootStretchWidth = true,
+                    ApplyScroll = true,
+                    MeasureText = MeasureText,
+                });
+            }
+            catch (Exception ex)
+            {
+                Debug.LogError($"[Iris.Iml] Layout failed: {ex}");
+                return;
+            }
+
+            var area = GUILayoutUtility.GetRect(
+                Mathf.Max(1f, root.Rect.width), Mathf.Max(1f, root.Rect.height));
+            DrawNode(root, area.position - root.Rect.position);
+
+            _rt.FlushEffects();
         }
 
-        private string ResolveReferencePath(string path)
+        /// <summary>Stretch to whatever width the ambient layout (loader scroll
+        /// view / window) offers this frame.</summary>
+        private float ProbeWidth()
         {
-            // Per spec: @/ = Mod root, @ = current file dir
-            var basePath = Path.GetDirectoryName(CurrentFilePath) ?? "";
-
-            if (path.StartsWith("@/"))
-            {
-                // Mod root: go up from ui/ to Resources/ to v3/ to Iridium/
-                // Actually, @/ resolves relative to the mod root (Main.ModPath)
-                // For now, resolve relative to basePath + ../../
-                return Path.GetFullPath(Path.Combine(basePath, "..", "..", path.Substring(2)));
-            }
-            if (path.StartsWith("@"))
-            {
-                return Path.GetFullPath(Path.Combine(basePath, path.Substring(1)));
-            }
-            // Bare path: relative to current file
-            return Path.Combine(basePath, path);
+            var rect = GUILayoutUtility.GetRect(1f, 1f, GUILayout.ExpandWidth(true));
+            return Mathf.Max(50f, rect.width);
         }
 
-        private void RenderText(ImlElement element)
-        {
-            var text = ResolveAttributeValue(element, "text");
-            var style = GetEffectiveStyle(element);
+        // ── text measurement (shared layout → IMGUI styles) ─────────────────
 
-            if (_layout != null)
-            {
-                var prevContent = GUI.contentColor;
-                if (style.Setters.TryGetValue("color", out var colorVal))
-                    GUI.contentColor = GetColor(colorVal);
-                _layout.Text(text, GetTextStyle(element));
-                GUI.contentColor = prevContent;
-            }
-            else
-            {
-                var gs = BuildTextStyle(style, element);
-                GUILayout.Label(text, gs, GetStyleOptions(style));
-            }
+        private Vector2 MeasureText(string text, int fontSize, float wrapWidth)
+        {
+            if (string.IsNullOrEmpty(text)) return new Vector2(0f, fontSize * 1.3f);
+            var content = new GUIContent(text);
+            var plain = GetMeasureStyle(fontSize, false);
+            var single = plain.CalcSize(content);
+            if (wrapWidth <= 0f || single.x <= wrapWidth) return single;
+            var wrap = GetMeasureStyle(fontSize, true);
+            return new Vector2(wrapWidth, wrap.CalcHeight(content, wrapWidth));
         }
 
-        /// <summary>
-        /// Resolve an attribute value regardless of its type (String, Expression, Template)
-        /// </summary>
-        private string ResolveAttributeValue(ImlElement element, string attrName)
+        private GUIStyle GetMeasureStyle(int fontSize, bool wrap)
         {
-            if (!element.Attributes.TryGetValue(attrName, out var attr))
-                return "";
-
-            switch (attr.Type)
+            var key = fontSize + "|" + (wrap ? 1 : 0);
+            if (_measureStyles.TryGetValue(key, out var cached)) return cached;
+            var gs = new GUIStyle(GUI.skin.label)
             {
-                case AttributeType.String:
-                    return attr.StringValue ?? "";
-                case AttributeType.Expression:
-                    try
+                fontSize = fontSize,
+                wordWrap = wrap,
+                richText = false,
+            };
+            _measureStyles[key] = gs;
+            return gs;
+        }
+
+        // ── draw ────────────────────────────────────────────────────────────
+
+        private static Rect Offset(Rect r, Vector2 tr)
+            => new Rect(r.x + tr.x, r.y + tr.y, r.width, r.height);
+
+        private ImlStateFlags ComputeState(ImlNode node, Vector2 tr)
+        {
+            var state = node.BuildState;
+            if (node.Element == null) return state;
+            var e = Event.current;
+            if (e == null) return state;
+            var p = e.mousePosition - tr;
+            if (node.Rect.Contains(p) && node.Clip.Contains(p))
+            {
+                state |= ImlStateFlags.Hover;
+                if (Input.GetMouseButton(0)) state |= ImlStateFlags.Press;
+            }
+            return state;
+        }
+
+        private void DrawNode(ImlNode node, Vector2 tr)
+        {
+            if (node == null || IsHidden(node)) return;
+            var r = Offset(node.Rect, tr);
+
+            var state = ComputeState(node, tr);
+            ImlStyle style = node.Style;
+            if (node.Element != null && state != node.BuildState)
+            {
+                style = _rt.Styles.Resolve(node.Element, node.Parent?.Style, state,
+                    _rt.ResolveAttributeValue);
+                // selector options carry a baked selected/unselected look
+                if (node.Kind == ImlNodeKind.SelectorOption)
+                    style = _rt.ResolveSelectorOptionStyle(style, node.OptionSelected);
+            }
+
+            switch (node.Kind)
+            {
+                case ImlNodeKind.Root:
+                case ImlNodeKind.Box:
+                    DrawBoxChildren(node, tr, style);
+                    break;
+
+                case ImlNodeKind.ScrollView:
+                    DrawScrollView(node, tr, style);
+                    break;
+
+                case ImlNodeKind.Text:
+                    GUI.Label(r, node.Text ?? "", GetTextStyle(style));
+                    break;
+
+                case ImlNodeKind.Link:
+                    DrawLink(node, r, style, state);
+                    break;
+
+                case ImlNodeKind.Image:
+                {
+                    var tex = _rt.LoadTexture(node.Source);
+                    if (tex != null) GUI.DrawTexture(r, tex, ScaleMode.StretchToFill);
+                    else GUI.Box(r, "Loading...");
+                    break;
+                }
+
+                case ImlNodeKind.Button:
+                    if (GUI.Button(r, node.Text ?? "", GetButtonStyle(style)))
                     {
-                        var result = _evaluator.Evaluate(attr.Expression);
-                        return result?.ToString() ?? "";
+                        var cmd = _rt.ResolveAttributeValue(node.Element, "command");
+                        if (!string.IsNullOrEmpty(cmd)) _rt.InvokeCommand(cmd);
+                        _rt.HandleElementEvents(node.Element);
                     }
-                    catch (Exception ex)
+                    break;
+
+                case ImlNodeKind.SelectorOption:
+                    if (GUI.Button(r, node.Text ?? "", GetButtonStyle(style)))
                     {
-                        Debug.LogWarning($"[Iris.Iml] Failed to evaluate expression '{attr.Expression}': {ex.Message}");
-                        return "";
+                        _rt.SetContextValue(node.ValueBinding, node.OptionKey);
+                        _rt.ScheduleEffect(() =>
+                            _rt.InvokeElementEvent(node.Element, "on-changed", node.OptionKey));
                     }
-                case AttributeType.Template:
-                    if (attr.Parts == null) return "";
-                    var sb = new System.Text.StringBuilder();
-                    foreach (var part in attr.Parts)
+                    break;
+
+                case ImlNodeKind.Switch:
+                    DrawSwitch(node, r, style, state);
+                    break;
+
+                case ImlNodeKind.Checkbox:
+                    DrawCheckbox(node, r, style, state);
+                    break;
+
+                case ImlNodeKind.Slider:
+                    DrawSlider(node, r, style, state);
+                    break;
+
+                case ImlNodeKind.TextField:
+                    DrawTextField(node, r, style);
+                    break;
+
+                case ImlNodeKind.TextArea:
+                    DrawTextArea(node, r, style);
+                    break;
+
+                case ImlNodeKind.Separator:
+                    DrawSeparator(r, style);
+                    break;
+
+                case ImlNodeKind.Icon:
+                    DrawIcon(node, r, style, state);
+                    break;
+
+                case ImlNodeKind.ArrowButton:
+                    DrawArrowButton(node, r, style, state);
+                    break;
+
+                case ImlNodeKind.CustomCanvas:
+                    if (!string.IsNullOrEmpty(node.OnDraw) &&
+                        _rt.DrawHandlers.TryGetValue(node.OnDraw, out var drawHandler))
                     {
-                        if (part.IsExpression)
+                        drawHandler(r, new RendererInternal.DrawArgs { Context = _rt.DataContext });
+                    }
+                    break;
+
+                // Fill / Spacer: pure layout, nothing to draw
+            }
+        }
+
+        private void DrawBoxChildren(ImlNode node, Vector2 tr, ImlStyle style)
+        {
+            var r = Offset(node.Rect, tr);
+            DrawBackground(r, style);
+
+            bool clip = string.Equals(StyleValues.GetStr(style, "overflow", ""),
+                "hidden", StringComparison.OrdinalIgnoreCase);
+            Vector2 trChild = tr;
+            if (clip)
+            {
+                GUI.BeginGroup(r);
+                trChild = -node.Rect.position;
+            }
+
+            foreach (var c in node.BgChildren) DrawNode(c, trChild);
+            foreach (var c in node.Children) DrawNode(c, trChild);
+            foreach (var c in node.FgChildren) DrawNode(c, trChild);
+
+            if (clip) GUI.EndGroup();
+        }
+
+        // ── scroll view ─────────────────────────────────────────────────────
+
+        private void DrawScrollView(ImlNode node, Vector2 tr, ImlStyle style)
+        {
+            var r = Offset(node.Rect, tr);
+            DrawBackground(r, style);
+
+            var vp = node.ViewportInner;
+            var vpDraw = Offset(vp, tr);
+
+            HandleScrollWheel(node, vpDraw);
+
+            GUI.BeginGroup(vpDraw);
+            Vector2 trChild = -vp.position;
+            foreach (var c in node.BgChildren) DrawNode(c, trChild);
+            foreach (var c in node.Children) DrawNode(c, trChild);
+            foreach (var c in node.FgChildren) DrawNode(c, trChild);
+            GUI.EndGroup();
+
+            DrawScrollBar(node, vpDraw);
+            _rt.SetScrollPos(node.ScrollKey, node.ScrollPos);
+        }
+
+        private void HandleScrollWheel(ImlNode node, Rect vpDraw)
+        {
+            var e = Event.current;
+            if (e == null || e.type != EventType.ScrollWheel || !vpDraw.Contains(e.mousePosition))
+                return;
+            float maxScroll = Mathf.Max(0f, node.ContentSize.y - node.ViewportInner.height);
+            node.ScrollPos = Mathf.Clamp(node.ScrollPos + e.delta.y * 15f, 0f, maxScroll);
+            _rt.SetScrollPos(node.ScrollKey, node.ScrollPos);
+            e.Use();
+        }
+
+        private void DrawScrollBar(ImlNode node, Rect vpDraw)
+        {
+            float contentMain = node.ContentSize.y;
+            float viewMain = vpDraw.height;
+            if (contentMain <= viewMain + 0.5f) return;
+
+            float maxScroll = contentMain - viewMain;
+            float scroll = Mathf.Clamp(node.ScrollPos, 0f, maxScroll);
+
+            var barRect = new Rect(vpDraw.xMax - 7f, vpDraw.y + 2f, 5f, vpDraw.height - 4f);
+            DrawFlat(new Rect(barRect.x + 1.5f, barRect.y, 2f, barRect.height),
+                new Color(0f, 0f, 0f, 0.25f));
+
+            float thumbH = Mathf.Max(20f, barRect.height * viewMain / contentMain);
+            float t = maxScroll > 0f ? scroll / maxScroll : 0f;
+            float thumbY = barRect.y + t * (barRect.height - thumbH);
+            var thumbRect = new Rect(barRect.x, thumbY, barRect.width, thumbH);
+            DrawShape(thumbRect, 2, new Color(1f, 1f, 1f, 0.45f), null, 0);
+
+            var e = Event.current;
+            if (e == null) return;
+            int id = GUIUtility.GetControlID("IrisScrollBar".GetHashCode(), FocusType.Passive, barRect);
+            switch (e.type)
+            {
+                case EventType.MouseDown:
+                    if (!barRect.Contains(e.mousePosition) || e.button != 0) break;
+                    GUIUtility.hotControl = id;
+                    if (e.mousePosition.y >= thumbRect.y && e.mousePosition.y <= thumbRect.yMax)
+                    {
+                        _scrollGrabOffset = e.mousePosition.y - thumbRect.y;
+                    }
+                    else
+                    {
+                        _scrollGrabOffset = thumbH / 2f;
+                        float dir = e.mousePosition.y < thumbRect.y ? -1f : 1f;
+                        scroll = Mathf.Clamp(scroll + dir * viewMain * 0.9f, 0f, maxScroll);
+                        node.ScrollPos = scroll;
+                        _rt.SetScrollPos(node.ScrollKey, scroll);
+                    }
+                    e.Use();
+                    break;
+
+                case EventType.MouseDrag:
+                    if (GUIUtility.hotControl != id) break;
+                    {
+                        float travel = barRect.height - thumbH;
+                        float pos = e.mousePosition.y - barRect.y - _scrollGrabOffset;
+                        float ns = travel > 0f ? pos / travel * maxScroll : 0f;
+                        node.ScrollPos = Mathf.Clamp(ns, 0f, maxScroll);
+                        _rt.SetScrollPos(node.ScrollKey, node.ScrollPos);
+                        e.Use();
+                    }
+                    break;
+
+                case EventType.MouseUp:
+                    if (GUIUtility.hotControl == id)
+                    {
+                        GUIUtility.hotControl = 0;
+                        e.Use();
+                    }
+                    break;
+            }
+        }
+
+        // ── controls ────────────────────────────────────────────────────────
+
+        private void DrawSwitch(ImlNode node, Rect r, ImlStyle style, ImlStateFlags state)
+        {
+            Color fill = node.Checked
+                ? StyleValues.GetColor(style, "switchOn", Hex("#D973A5"))
+                : StyleValues.GetColor(style, "switchOff", Hex("#313338"));
+            Color knob = StyleValues.GetColor(style, "knobColor", Color.white);
+            float opacity = StyleValues.GetFloat(style, "opacity", 1f);
+            fill.a *= opacity;
+            knob.a *= opacity;
+
+            int radius = Mathf.Max(1, Mathf.RoundToInt(r.height / 2f));
+            DrawShape(r, radius, fill, null, 0);
+
+            float d = r.height - 4f;
+            float kx = node.Checked ? r.xMax - d - 2f : r.x + 2f;
+            var knobTex = GuiTextureFactory.GetCircle(Mathf.RoundToInt(d), knob);
+            GUI.DrawTexture(new Rect(kx, r.y + 2f, d, d), knobTex);
+
+            DrawHoverOverlay(r, radius, state);
+
+            if (GUI.Button(r, GUIContent.none, GUIStyle.none))
+                Toggle(node);
+        }
+
+        private void DrawCheckbox(ImlNode node, Rect r, ImlStyle style, ImlStateFlags state)
+        {
+            Color bg = node.Checked
+                ? StyleValues.GetColor(style, "checkBg", Hex("#D973A5"))
+                : StyleValues.GetColor(style, "background", Hex("#313338"));
+            Color border = StyleValues.GetColor(style, "borderColor", Hex("#494F5C"));
+            Color check = StyleValues.GetColor(style, "checkColor", Color.white);
+            float opacity = StyleValues.GetFloat(style, "opacity", 1f);
+            bg.a *= opacity;
+            border.a *= opacity;
+            check.a *= opacity;
+
+            int radius = 4;
+            DrawShape(r, radius, bg, border, 1);
+            if (node.Checked)
+            {
+                var chk = GuiTextureFactory.GetCheckmark(Mathf.RoundToInt(r.width), check);
+                GUI.DrawTexture(r, chk);
+            }
+
+            DrawHoverOverlay(r, radius, state);
+
+            if (GUI.Button(r, GUIContent.none, GUIStyle.none))
+                Toggle(node);
+        }
+
+        private void Toggle(ImlNode node)
+        {
+            var newVal = !node.Checked;
+            if (!string.IsNullOrEmpty(node.ValueBinding))
+                _rt.SetContextValue(node.ValueBinding, newVal);
+            _rt.ScheduleEffect(() => _rt.InvokeElementEvent(node.Element, "on-changed", newVal));
+        }
+
+        private void DrawSlider(ImlNode node, Rect r, ImlStyle style, ImlStateFlags state)
+        {
+            float min = node.Min, max = node.Max;
+            float value = node.FloatValue;
+            float trackW = r.width - (node.ShowValue ? LayoutEngine.SliderValueBox : 0f);
+            if (trackW < 10f) trackW = 10f;
+
+            Color trackC = StyleValues.GetColor(style, "sliderTrack", Hex("#313338"));
+            Color fillC = StyleValues.GetColor(style, "sliderFill", Hex("#D973A5"));
+            Color thumbC = StyleValues.GetColor(style, "sliderThumb", Color.white);
+            float opacity = StyleValues.GetFloat(style, "opacity", 1f);
+            trackC.a *= opacity; fillC.a *= opacity; thumbC.a *= opacity;
+
+            const float trackH = 6f;
+            var trackRect = new Rect(r.x, r.y + (r.height - trackH) / 2f, trackW, trackH);
+            var hitRect = new Rect(r.x, r.y, trackW, r.height);
+
+            float maxScroll = max - min;
+            Func<float, float> posToValue = x =>
+            {
+                float t = maxScroll > 0f ? Mathf.Clamp01((x - trackRect.x) / trackRect.width) : 0f;
+                float v = min + t * maxScroll;
+                if (node.Step > 0f)
+                    v = min + Mathf.Round((v - min) / node.Step) * node.Step;
+                return Mathf.Clamp(v, min, max);
+            };
+
+            var e = Event.current;
+            int id = GUIUtility.GetControlID("IrisSlider".GetHashCode(), FocusType.Passive, hitRect);
+            if (e != null)
+            {
+                switch (e.type)
+                {
+                    case EventType.MouseDown:
+                        if (e.button == 0 && hitRect.Contains(e.mousePosition))
                         {
-                            try
-                            {
-                                var result = _evaluator.Evaluate(part.Value);
-                                sb.Append(result?.ToString() ?? "");
-                            }
-                            catch
-                            {
-                                sb.Append("");
-                            }
+                            GUIUtility.hotControl = id;
+                            value = posToValue(e.mousePosition.x);
+                            e.Use();
                         }
-                        else
+                        break;
+                    case EventType.MouseDrag:
+                        if (GUIUtility.hotControl == id)
                         {
-                            sb.Append(part.Value);
+                            value = posToValue(e.mousePosition.x);
+                            e.Use();
                         }
-                    }
-                    return sb.ToString();
-                case AttributeType.Boolean:
-                    return attr.BoolValue ? "true" : "false";
-                case AttributeType.StyleObject:
-                    return "";
-                default:
-                    return attr.StringValue ?? "";
-            }
-        }
-
-        /// <summary>
-        /// 超链接组件：渲染为下划线链接文字，点击后打开 url 属性指向的地址。
-        /// </summary>
-        private void RenderLink(ImlElement element)
-        {
-            var text = ResolveAttributeValue(element, "text");
-            var url = element.GetString("url");
-            if (string.IsNullOrEmpty(text) || string.IsNullOrEmpty(url)) return;
-
-            if (_layout != null)
-            {
-                _layout.Link(text, url);
-            }
-            else
-            {
-                var gs = new GUIStyle(GUI.skin.label) { richText = true };
-                gs.normal.textColor = new Color(0.851f, 0.451f, 0.647f);
-                gs.hover.textColor = Color.white;
-                if (GUILayout.Button(new GUIContent($"<u>{text}</u>"), gs))
-                    Application.OpenURL(url);
-            }
-        }
-
-        private void RenderImage(ImlElement element)
-        {
-            var source = element.GetString("source");
-            var widthStr = element.GetString("width");
-            var heightStr = element.GetString("height");
-
-            int width = string.IsNullOrEmpty(widthStr) ? 100 : int.Parse(widthStr);
-            int height = string.IsNullOrEmpty(heightStr) ? 100 : int.Parse(heightStr);
-
-            var texture = LoadTexture(source);
-
-            if (texture != null)
-            {
-                GUI.DrawTexture(new Rect(0, 0, width, height), texture);
-            }
-            else
-            {
-                GUI.Box(new Rect(0, 0, width, height), "Loading...");
-            }
-        }
-
-        private void RenderButton(ImlElement element)
-        {
-            var text = ResolveAttributeValue(element, "text");
-            var command = element.GetString("command");
-            var style = GetEffectiveStyle(element);
-
-            bool clicked;
-            if (_layout != null)
-            {
-                var prevBg = GUI.backgroundColor;
-                var prevContent = GUI.contentColor;
-                if (style.Setters.TryGetValue("background", out var bgVal))
-                    GUI.backgroundColor = GetColor(bgVal);
-                if (style.Setters.TryGetValue("color", out var colorVal))
-                    GUI.contentColor = GetColor(colorVal);
-                clicked = _layout.Button(text, GetButtonStyle(element));
-                GUI.backgroundColor = prevBg;
-                GUI.contentColor = prevContent;
-            }
-            else
-            {
-                var gs = BuildGuiStyle(style, element);
-                clicked = GUILayout.Button(text, gs, GetStyleOptions(style));
-            }
-
-            if (clicked)
-            {
-                if (!string.IsNullOrEmpty(command))
-                    InvokeCommand(command);
-                HandleElementEvents(element);
-            }
-        }
-
-        private void RenderSwitch(ImlElement element)
-        {
-            var valueBinding = element.GetExpression("value");
-            var onChanged = element.GetString("on-changed");
-            var text = ResolveAttributeValue(element, "text");
-
-            if (!string.IsNullOrEmpty(text))
-            {
-                var style = GetEffectiveStyle(element);
-                var prevContent = GUI.contentColor;
-                if (style.Setters.TryGetValue("color", out var colorVal))
-                    GUI.contentColor = GetColor(colorVal);
-                if (_layout != null)
-                    _layout.Text(text, IrrTextStyle.Normal);
-                else
-                    GUILayout.Label(text);
-                GUI.contentColor = prevContent;
-            }
-
-            bool currentValue = false;
-            if (!string.IsNullOrEmpty(valueBinding))
-            {
-                var val = _evaluator.Evaluate(valueBinding);
-                currentValue = val is bool b && b;
-            }
-
-            bool? result;
-            if (_layout != null)
-                result = _layout.Switch(currentValue);
-            else
-            {
-                var style = GetEffectiveStyle(element);
-                var onHex = GetStyleString(style, "switchOn", "#D973A5");
-                var offHex = GetStyleString(style, "switchOff", "#313338");
-                var knobHex = GetStyleString(style, "knobColor", "#FFFFFF");
-                Color onColor = GetColor(onHex);
-                Color offColor = GetColor(offHex);
-                Color knobColor = GetColor(knobHex);
-
-                int w = 40, h = 22;
-                var tex = GuiTextureFactory.GetPill(w, h,
-                    currentValue ? onColor : offColor,
-                    knobColor,
-                    currentValue ? 1f : 0f);
-                var gs = new GUIStyle();
-                gs.normal.background = gs.hover.background = gs.active.background = tex;
-                gs.border = new RectOffset(h / 2, h / 2, h / 2, h / 2);
-
-                GUI.changed = false;
-                bool newValue = GUILayout.Toggle(currentValue, "", gs, GUILayout.Width(w), GUILayout.Height(h));
-                result = GUI.changed ? newValue : (bool?)null;
-            }
-
-            if (result.HasValue && !string.IsNullOrEmpty(valueBinding))
-                SetContextValue(valueBinding, result.Value);
-            if (result.HasValue && !string.IsNullOrEmpty(onChanged))
-                ScheduleEffect(() => InvokeHandler(onChanged, result.Value));
-        }
-
-        private void RenderCheckbox(ImlElement element)
-        {
-            var valueBinding = element.GetExpression("value");
-            var onChanged = element.GetString("on-changed");
-            var text = ResolveAttributeValue(element, "text");
-
-            if (!string.IsNullOrEmpty(text))
-            {
-                var style = GetEffectiveStyle(element);
-                var prevContent = GUI.contentColor;
-                if (style.Setters.TryGetValue("color", out var colorVal))
-                    GUI.contentColor = GetColor(colorVal);
-                if (_layout != null)
-                    _layout.Text(text, IrrTextStyle.Normal);
-                else
-                    GUILayout.Label(text);
-                GUI.contentColor = prevContent;
-            }
-
-            bool currentValue = false;
-            if (!string.IsNullOrEmpty(valueBinding))
-            {
-                var val = _evaluator.Evaluate(valueBinding);
-                currentValue = val is bool b && b;
-            }
-
-            bool? result;
-            if (_layout != null)
-                result = _layout.Checkbox(currentValue);
-            else
-            {
-                var style = GetEffectiveStyle(element);
-                var bgHex = GetStyleString(style, "background", "#313338");
-                var borderHex = GetStyleString(style, "borderColor", "#494F5C");
-                var checkHex = GetStyleString(style, "checkColor", "#FFFFFF");
-                var onBgHex = GetStyleString(style, "checkBg", "#D973A5");
-                Color bg = GetColor(bgHex);
-                Color borderCol = GetColor(borderHex);
-                Color check = GetColor(checkHex);
-                int sz = 22, radius = 4;
-
-                if (currentValue)
-                {
-                    var tex = GuiTextureFactory.GetRoundedRect(sz, sz, radius, GetColor(onBgHex), null, 0);
-                    var gs = new GUIStyle();
-                    gs.normal.background = gs.hover.background = gs.active.background = tex;
-                    gs.border = new RectOffset(radius, radius, radius, radius);
-                    GUI.changed = false;
-                    bool newValue = GUILayout.Toggle(true, "", gs, GUILayout.Width(sz), GUILayout.Height(sz));
-                    result = GUI.changed ? false : (bool?)null;
-
-                    // Overlay checkmark
-                    var chk = GuiTextureFactory.GetCheckmark(sz, check);
-                    var rect = GUILayoutUtility.GetLastRect();
-                    GUI.DrawTexture(rect, chk);
-                }
-                else
-                {
-                    var tex = GuiTextureFactory.GetRoundedRect(sz, sz, radius, bg, borderCol, 1);
-                    var gs = new GUIStyle();
-                    gs.normal.background = gs.hover.background = gs.active.background = tex;
-                    gs.border = new RectOffset(radius, radius, radius, radius);
-                    GUI.changed = false;
-                    bool newValue = GUILayout.Toggle(false, "", gs, GUILayout.Width(sz), GUILayout.Height(sz));
-                    result = GUI.changed ? true : (bool?)null;
+                        break;
+                    case EventType.MouseUp:
+                        if (GUIUtility.hotControl == id)
+                        {
+                            GUIUtility.hotControl = 0;
+                            e.Use();
+                        }
+                        break;
                 }
             }
 
-            if (result.HasValue && !string.IsNullOrEmpty(valueBinding))
-                SetContextValue(valueBinding, result.Value);
-            if (result.HasValue && !string.IsNullOrEmpty(onChanged))
-                ScheduleEffect(() => InvokeHandler(onChanged, result.Value));
-        }
-
-		private void RenderSlider(ImlElement element)
-		{
-			var valueBinding = element.GetExpression("value");
-			var minStr = element.GetString("min");
-			var maxStr = element.GetString("max");
-			var showValueStr = element.GetString("showValue");
-			var onChanged = element.GetString("on-changed");
-
-			float min = string.IsNullOrEmpty(minStr) ? 0 : float.Parse(minStr);
-			float max = string.IsNullOrEmpty(maxStr) ? 100 : float.Parse(maxStr);
-			bool showValue = showValueStr == "true";
-
-			float currentValue = min;
-			if (!string.IsNullOrEmpty(valueBinding))
-			{
-				var val = _evaluator.Evaluate(valueBinding);
-				currentValue = Convert.ToSingle(val);
-			}
-
-			bool isInt = currentValue == Mathf.Round(currentValue) && max > 1;
-			var fmt = isInt ? "F0" : "F2";
-
-			GUI.changed = false;
-			float newValue = GUILayout.HorizontalSlider(currentValue, min, max, GUILayout.MinWidth(80));
-			if (showValue)
-			{
-				GUILayout.Space(5);
-				var textValue = newValue.ToString(fmt);
-				if (_layout != null)
-				{
-					var layoutResult = _layout.TextField(textValue);
-					if (layoutResult != null && float.TryParse(layoutResult, out var parsed))
-					{
-						parsed = Mathf.Clamp(parsed, min, max);
-						if (Math.Abs(parsed - newValue) > 0.001f)
-						{
-							newValue = parsed;
-							GUI.changed = true;
-						}
-					}
-				}
-				else
-				{
-					var guiResult = GUILayout.TextField(textValue, GUILayout.Width(50));
-					if (float.TryParse(guiResult, out var parsed))
-					{
-						parsed = Mathf.Clamp(parsed, min, max);
-						if (Math.Abs(parsed - newValue) > 0.001f)
-						{
-							newValue = parsed;
-							GUI.changed = true;
-						}
-					}
-				}
-			}
-
-			if (GUI.changed)
-			{
-				if (!string.IsNullOrEmpty(valueBinding))
-					SetContextValue(valueBinding, newValue);
-				if (!string.IsNullOrEmpty(onChanged))
-					ScheduleEffect(() => InvokeHandler(onChanged, newValue));
-			}
-		}
-
-        private void RenderTextField(ImlElement element)
-        {
-            var valueBinding = element.GetExpression("value");
-            var onSubmit = element.GetString("on-text-submit");
-
-            string currentValue = "";
-            if (!string.IsNullOrEmpty(valueBinding))
+            // value box
+            if (node.ShowValue)
             {
-                var val = _evaluator.Evaluate(valueBinding);
-                currentValue = val?.ToString() ?? "";
-            }
-
-            string newValue = null;
-            if (_layout != null)
-            {
-                var style = GetEffectiveStyle(element);
-                var prevBg = GUI.backgroundColor;
-                var prevContent = GUI.contentColor;
-                if (style.Setters.TryGetValue("background", out var bgHex))
-                    GUI.backgroundColor = GetColor(bgHex);
-                if (style.Setters.TryGetValue("color", out var colorHex))
-                    GUI.contentColor = GetColor(colorHex);
-                newValue = _layout.TextField(currentValue);
-                GUI.backgroundColor = prevBg;
-                GUI.contentColor = prevContent;
-            }
-            else
-            {
-                var style = GetEffectiveStyle(element);
-                var bgHex = GetStyleString(style, "background", "#151719");
-                var borderHex = GetStyleString(style, "borderColor", "#222326");
-                var focusHex = GetStyleString(style, "focusBorder", "#D973A5");
-                var colorHex = GetStyleString(style, "color", "#E9ECEF");
-                int radius = GetStyleInt(style, "radius", 8);
-                int borderWidth = GetStyleInt(style, "borderWidth", 1);
-
-                Color bg = GetColor(bgHex);
-                Color borderCol = GetColor(borderHex);
-                Color focusCol = GetColor(focusHex);
-                int texSize = Mathf.Max(2 * radius + 2, 16);
-
-                var normalTex = GuiTextureFactory.GetRoundedRect(texSize, texSize, radius, bg, borderCol, borderWidth);
-                var focusTex = GuiTextureFactory.GetRoundedRect(texSize, texSize, radius, bg, focusCol, borderWidth);
-                var gs = new GUIStyle(GUI.skin.textField);
-                gs.normal.background = normalTex;
-                gs.hover.background = normalTex;
-                gs.active.background = focusTex;
-                gs.focused.background = focusTex;
-                gs.normal.textColor = gs.hover.textColor = gs.active.textColor = gs.focused.textColor = GetColor(colorHex);
-                gs.border = new RectOffset(radius, radius, radius, radius);
-                gs.padding = new RectOffset(6, 6, 4, 4);
-
-                GUI.changed = false;
-                newValue = GUILayout.TextField(currentValue, gs, GUILayout.ExpandWidth(true));
-                if (!GUI.changed)
-                    newValue = null;
-            }
-
-            if (newValue != null && !string.IsNullOrEmpty(valueBinding))
-                SetContextValue(valueBinding, newValue);
-
-            if (newValue != null && !string.IsNullOrEmpty(onSubmit))
-                ScheduleEffect(() => InvokeHandler(onSubmit, newValue));
-
-            if (Event.current.type == EventType.KeyDown && Event.current.keyCode == KeyCode.Return)
-                ScheduleEffect(() => InvokeHandler(onSubmit, newValue ?? currentValue));
-        }
-
-        private void RenderTextArea(ImlElement element)
-        {
-            var valueBinding = element.GetExpression("value");
-            var linesStr = element.GetString("lines");
-            var lines = string.IsNullOrEmpty(linesStr) ? 3 : int.Parse(linesStr);
-
-            string currentValue = "";
-            if (!string.IsNullOrEmpty(valueBinding))
-            {
-                var val = _evaluator.Evaluate(valueBinding);
-                currentValue = val?.ToString() ?? "";
-            }
-
-            GUI.changed = false;
-            string newValue = GUILayout.TextArea(currentValue, lines, GUILayout.ExpandWidth(true), GUILayout.Height(lines * 20));
-
-            // Two-way binding: write the new value back to the data context
-            // when the user edits. (Bug: "判定文本无法修改" — without this, the
-            // bound CLR field never sees the new value.)
-            if (GUI.changed && !string.IsNullOrEmpty(valueBinding))
-                SetContextValue(valueBinding, newValue);
-        }
-
-        private void RenderSeparator(ImlElement element)
-        {
-            var style = GetEffectiveStyle(element);
-
-            if (_layout != null)
-            {
-                var prevBg = GUI.backgroundColor;
-                if (style.Setters.TryGetValue("background", out var bgHex))
-                    GUI.backgroundColor = GetColor(bgHex);
-                _layout.Separator();
-                GUI.backgroundColor = prevBg;
-                return;
-            }
-
-            var sepColor = GetStyleString(style, "background", "#20FFFFFF");
-            Color c = GetColor(sepColor);
-            int h = 1;
-            var tex = new Texture2D(2, h, TextureFormat.RGBA32, false);
-            tex.hideFlags = HideFlags.HideAndDontSave;
-            for (int x = 0; x < 2; x++)
-                tex.SetPixel(x, 0, c);
-            tex.Apply();
-            tex.wrapMode = TextureWrapMode.Repeat;
-
-            GUILayout.Space(2);
-            GUILayout.Box("", GUILayout.ExpandWidth(true), GUILayout.Height(h));
-            GUILayout.Space(2);
-        }
-
-        private void RenderForEach(ImlElement element)
-        {
-            var itemsBinding = element.GetExpression("items");
-            var keyBinding = element.GetString("key");
-            var template = element.GetString("template");
-
-            if (string.IsNullOrEmpty(itemsBinding) || string.IsNullOrEmpty(template))
-                return;
-
-            var itemsObj = _evaluator.Evaluate(itemsBinding);
-            if (itemsObj == null) return;
-
-            IEnumerable items = null;
-            if (itemsObj is IEnumerable)
-                items = itemsObj as IEnumerable;
-            else
-                return;
-
-            foreach (var item in items)
-            {
-                _evaluator.SetVariable("item", item);
-
-                var templateElement = FindTemplate(template);
-                if (templateElement != null)
+                var vb = new Rect(r.xMax - 50f, r.y + (r.height - 24f) / 2f, 50f, 24f);
+                bool isInt = Mathf.Approximately(value, Mathf.Round(value)) && max > 1f;
+                var txt = GUI.TextField(vb, value.ToString(isInt ? "F0" : "F2"),
+                    GetFieldStyle(style));
+                if (StyleValues.TryParseNumber(txt, out var parsed))
                 {
-                    foreach (var child in templateElement.Children)
-                    {
-                        if (child is ImlElement childElement)
-                            RenderElement(childElement);
-                    }
+                    parsed = Mathf.Clamp(parsed, min, max);
+                    if (Mathf.Abs(parsed - value) > 0.001f) value = parsed;
                 }
             }
 
-            _evaluator.SetVariable("item", null);
+            // draw track + fill + thumb
+            float t0 = maxScroll > 0f ? Mathf.Clamp01((value - min) / maxScroll) : 0f;
+            DrawShape(trackRect, Mathf.RoundToInt(trackH / 2f), trackC, null, 0);
+            if (t0 > 0f)
+            {
+                DrawShape(new Rect(trackRect.x, trackRect.y, trackRect.width * t0, trackH),
+                    Mathf.RoundToInt(trackH / 2f), fillC, null, 0);
+            }
+            float thumbD = Mathf.Min(r.height, 14f);
+            float thumbX = trackRect.x + trackRect.width * t0 - thumbD / 2f;
+            var thumbRect = new Rect(thumbX, r.y + (r.height - thumbD) / 2f, thumbD, thumbD);
+            GUI.DrawTexture(thumbRect,
+                GuiTextureFactory.GetCircle(Mathf.RoundToInt(thumbD), thumbC));
+
+            if ((state & ImlStateFlags.Hover) != 0 || GUIUtility.hotControl == id)
+                DrawHoverOverlay(new Rect(hitRect.x, r.y, hitRect.width, r.height),
+                    Mathf.RoundToInt(r.height / 2f), state);
+
+            // apply changes
+            if (!Mathf.Approximately(value, node.FloatValue))
+            {
+                node.FloatValue = value;
+                if (!string.IsNullOrEmpty(node.ValueBinding))
+                    _rt.SetContextValue(node.ValueBinding, value);
+                _rt.ScheduleEffect(() => _rt.InvokeElementEvent(node.Element, "on-changed", value));
+            }
         }
 
-        private ImlElement FindTemplate(string name)
+        private void DrawTextField(ImlNode node, Rect r, ImlStyle style)
         {
-            foreach (var child in _document.Root.Children)
+            var gs = GetFieldStyle(style);
+            var e = Event.current;
+            bool submitKey = e != null && e.type == EventType.KeyDown &&
+                             (e.keyCode == KeyCode.Return || e.keyCode == KeyCode.KeypadEnter);
+
+            string newValue = GUI.TextField(r, node.Text ?? "", gs);
+            bool changed = newValue != node.Text;
+            if (changed)
             {
-                if (child is ImlElement element && element.TagName == "Resources")
+                node.Text = newValue;
+                if (!string.IsNullOrEmpty(node.ValueBinding))
+                    _rt.SetContextValue(node.ValueBinding, newValue);
+                if (!string.IsNullOrEmpty(node.OnChange))
+                    _rt.ScheduleEffect(() =>
+                        _rt.InvokeElementEvent(node.Element, "on-changed", newValue));
+            }
+
+            // Old semantics: on-text-submit fires while typing and on Return.
+            if (!string.IsNullOrEmpty(node.OnSubmit))
+            {
+                if (changed)
+                    _rt.ScheduleEffect(() =>
+                        _rt.InvokeElementEvent(node.Element, "on-text-submit", newValue));
+                if (submitKey)
                 {
-                    foreach (var resource in element.Children)
-                    {
-                        if (resource is ImlElement res && res.TagName == "Template" && res.GetString("name") == name)
-                            return res;
-                    }
+                    var submitted = node.Text ?? "";
+                    _rt.ScheduleEffect(() =>
+                        _rt.InvokeElementEvent(node.Element, "on-text-submit", submitted));
                 }
             }
-            return null;
         }
 
-        private void RenderCustomCanvas(ImlElement element)
+        private void DrawTextArea(ImlNode node, Rect r, ImlStyle style)
         {
-            var onDraw = element.GetString("on-draw");
-            var widthStr = element.GetString("width");
-            var heightStr = element.GetString("height");
-
-            int width = string.IsNullOrEmpty(widthStr) ? 100 : int.Parse(widthStr);
-            int height = string.IsNullOrEmpty(heightStr) ? 100 : int.Parse(heightStr);
-
-            if (_drawHandlers.TryGetValue(onDraw, out var handler))
+            var gs = GetFieldStyle(style);
+            string newValue = GUI.TextArea(r, node.Text ?? "", gs);
+            if (newValue != node.Text)
             {
-                var rect = GUILayoutUtility.GetRect(width, height);
-                handler(rect, new RendererInternal.DrawArgs { Context = _dataContext });
+                node.Text = newValue;
+                if (!string.IsNullOrEmpty(node.ValueBinding))
+                    _rt.SetContextValue(node.ValueBinding, newValue);
+                if (!string.IsNullOrEmpty(node.OnChange))
+                    _rt.ScheduleEffect(() =>
+                        _rt.InvokeElementEvent(node.Element, "on-changed", newValue));
             }
         }
 
-        private string GetEffectiveStyleName(ImlElement element)
+        private void DrawSeparator(Rect r, ImlStyle style)
         {
-            var styleVal = ResolveAttributeValue(element, "style");
-            if (!string.IsNullOrEmpty(styleVal)) return styleVal;
-            return ResolveAttributeValue(element, "class");
+            var c = StyleValues.GetColor(style, "background", Hex("#20FFFFFF"));
+            c.a *= StyleValues.GetFloat(style, "opacity", 1f);
+            DrawFlat(r, c);
         }
 
-        private IrrContStyle GetContainerStyle(ImlElement element)
+        private void DrawIcon(ImlNode node, Rect r, ImlStyle style, ImlStateFlags state)
         {
-            var classVal = ResolveAttributeValue(element, "class")?.ToLowerInvariant();
-            var styleVal = ResolveAttributeValue(element, "style")?.ToLowerInvariant();
-            var key = classVal;
-            if (styleVal == "padding" || styleVal == "background")
-                key = styleVal;
-            return key switch
-            {
-                "padding" => IrrContStyle.Padding,
-                "background" => IrrContStyle.Background,
-                _ => IrrContStyle.None
-            };
-        }
+            Color circle = StyleValues.GetColor(style, "background", Hex("#494F5C"));
+            Color border = StyleValues.GetColor(style, "borderColor", Hex("#313338"));
+            Color sym = StyleValues.GetColor(style, "color", Color.white);
+            float opacity = StyleValues.GetFloat(style, "opacity", 1f);
+            circle.a *= opacity; border.a *= opacity; sym.a *= opacity;
 
-        private IrrTextStyle GetTextStyle(ImlElement element)
-        {
-            var key = GetEffectiveStyleName(element)?.ToLowerInvariant();
-            return key switch
-            {
-                "title" => IrrTextStyle.Title,
-                "subtitle" => IrrTextStyle.Subtitle,
-                "secondary" => IrrTextStyle.Secondary,
-                "hint" => IrrTextStyle.Secondary,
-                _ => IrrTextStyle.Normal
-            };
-        }
+            int sz = Mathf.Max(4, Mathf.RoundToInt(r.width));
+            GUI.DrawTexture(r, GuiTextureFactory.GetCircle(sz, circle, border, 2));
+            GUI.DrawTexture(r, GuiTextureFactory.GetIconSymbol(sz, MapIcon(node.IconType), sym));
 
-        private IrrButStyle GetButtonStyle(ImlElement element)
-        {
-            var key = GetEffectiveStyleName(element)?.ToLowerInvariant();
-            return key switch
+            if (HasEvents(node.Element))
             {
-                "primary" => IrrButStyle.Primary,
-                _ => IrrButStyle.Element
-            };
-        }
-
-        private string GetFlexChildText(object child)
-        {
-            if (child is string s) return s;
-            if (child is ExpressionValue ev && !string.IsNullOrWhiteSpace(ev.Expression))
-            {
-                try { return _evaluator.Evaluate(ev.Expression)?.ToString() ?? ""; }
-                catch { return ""; }
+                DrawHoverOverlay(r, sz / 2, state);
+                if (GUI.Button(r, GUIContent.none, GUIStyle.none))
+                    _rt.HandleElementEvents(node.Element);
             }
-            return "";
         }
 
-        private void RenderIcon(ImlElement element)
+        private void DrawArrowButton(ImlNode node, Rect r, ImlStyle style, ImlStateFlags state)
         {
-            var style = GetEffectiveStyle(element);
-
-            if (_layout != null)
-            {
-                var prevBg = GUI.backgroundColor;
-                var prevContent = GUI.contentColor;
-                if (style.Setters.TryGetValue("background", out var bgHex))
-                    GUI.backgroundColor = GetColor(bgHex);
-                if (style.Setters.TryGetValue("color", out var colorHex))
-                    GUI.contentColor = GetColor(colorHex);
-                bool clicked = _layout.Icon(GetIconStyle(element));
-                GUI.backgroundColor = prevBg;
-                GUI.contentColor = prevContent;
-                if (clicked)
-                    HandleElementEvents(element);
-                return;
-            }
-
-            var iconType = GetIconStyle(element);
-            int sz = 22;
-            int radius = sz / 2;
-            Color circleColor = GetColor(GetStyleString(style, "background", "#494F5C"));
-            Color borderColor = GetColor(GetStyleString(style, "borderColor", "#313338_Hovered"));
-            Color symbolColor = GetColor(GetStyleString(style, "color", "#FFFFFF"));
-
-            var circle = GuiTextureFactory.GetCircle(sz, circleColor, borderColor, 2);
-            var gs = new GUIStyle();
-            gs.normal.background = circle;
-            gs.fixedWidth = sz;
-            gs.fixedHeight = sz;
-
-            GUILayout.Box("", gs);
-            var rect = GUILayoutUtility.GetLastRect();
-
-            var symbolKind = iconType switch
-            {
-                IrrIconStyle.Information => GuiTextureFactory.IconSymbol.Information,
-                IrrIconStyle.Success => GuiTextureFactory.IconSymbol.Success,
-                IrrIconStyle.Warning => GuiTextureFactory.IconSymbol.Warning,
-                IrrIconStyle.Error => GuiTextureFactory.IconSymbol.Error,
-                IrrIconStyle.Stop => GuiTextureFactory.IconSymbol.Stop,
-                _ => GuiTextureFactory.IconSymbol.Information
-            };
-            var sym = GuiTextureFactory.GetIconSymbol(sz, symbolKind, symbolColor);
-            GUI.DrawTexture(rect, sym);
-        }
-
-        private void RenderArrowButton(ImlElement element)
-        {
-            var dirStr = ResolveAttributeValue(element, "direction");
-            if (string.IsNullOrEmpty(dirStr)) dirStr = "right";
-            var dir = dirStr.ToLowerInvariant() switch
+            var dir = node.Direction switch
             {
                 "down" => GuiTextureFactory.ArrowDir.Down,
                 "left" => GuiTextureFactory.ArrowDir.Left,
                 "up" => GuiTextureFactory.ArrowDir.Up,
-                _ => GuiTextureFactory.ArrowDir.Right
+                _ => GuiTextureFactory.ArrowDir.Right,
             };
+            Color bg = StyleValues.GetColor(style, "background", Hex("#313338"));
+            Color border = StyleValues.GetColor(style, "borderColor", Hex("#494F5C"));
+            Color arrowC = StyleValues.GetColor(style, "color", Color.white);
+            float opacity = StyleValues.GetFloat(style, "opacity", 1f);
+            bg.a *= opacity; border.a *= opacity; arrowC.a *= opacity;
+            int radius = Mathf.Max(0, Mathf.RoundToInt(StyleValues.GetFloat(style, "radius", 4f)));
+            int sz = Mathf.Max(4, Mathf.RoundToInt(r.width));
 
-            var style = GetEffectiveStyle(element);
-            var bgHex = GetStyleString(style, "background", "#313338");
-            var borderHex = GetStyleString(style, "borderColor", "#494F5C");
-            var arrowHex = GetStyleString(style, "color", "#FFFFFF");
-            int sz = 22, radius = 4;
-
-            // 优先使用宿主注入的单纹理合成（背景+边框+箭头烘焙在一张图上，
-            // 一次绘制），避免两层 DrawTexture 叠加在半像素对齐时产生渗色。
+            bool clicked;
             if (GuiTextureFactory.TryGetExternalArrowButton(
-                    sz, dir, GetColor(bgHex), GetColor(borderHex), 1, radius, GetColor(arrowHex),
-                    out var composedTex))
+                    sz, dir, bg, border, 1, radius, arrowC, out var composed))
             {
-                var single = new GUIStyle();
-                single.normal.background = single.hover.background = single.active.background = composedTex;
-                single.border = new RectOffset(radius, radius, radius, radius);
-                single.fixedWidth = sz;
-                single.fixedHeight = sz;
-
-                if (GUILayout.Button("", single, GUILayout.Width(sz), GUILayout.Height(sz)))
-                    HandleElementEvents(element);
-                return;
-            }
-
-            var tex = GuiTextureFactory.GetRoundedRect(sz, sz, radius, GetColor(bgHex), GetColor(borderHex), 1);
-            var gs = new GUIStyle();
-            gs.normal.background = gs.hover.background = gs.active.background = tex;
-            gs.border = new RectOffset(radius, radius, radius, radius);
-            gs.fixedWidth = sz;
-            gs.fixedHeight = sz;
-
-            bool clicked = GUILayout.Button("", gs, GUILayout.Width(sz), GUILayout.Height(sz));
-            var rect = GUILayoutUtility.GetLastRect();
-            var arr = GuiTextureFactory.GetArrow(sz, dir, GetColor(arrowHex));
-            GUI.DrawTexture(rect, arr);
-
-            if (clicked)
-                HandleElementEvents(element);
-        }
-
-        private void RenderSelector(ImlElement element)
-        {
-            var valueBinding = element.GetExpression("value");
-            var itemsStr = element.GetExpression("items");
-            var onChanged = element.GetString("on-changed");
-
-            if (string.IsNullOrEmpty(itemsStr)) return;
-
-            var itemsObj = _evaluator.Evaluate(itemsStr);
-            if (itemsObj is not IList items) return;
-
-            string currentStr = "";
-            if (!string.IsNullOrEmpty(valueBinding))
-            {
-                var val = _evaluator.Evaluate(valueBinding);
-                currentStr = val?.ToString() ?? "";
-            }
-
-            bool changed = false;
-            string newValue = currentStr;
-
-            var elementStyle = GetEffectiveStyle(element);
-            var selectedBg = GetStyleString(elementStyle, "selectedBg", "#D973A5");
-            var selectedColor = GetStyleString(elementStyle, "selectedColor", "#FFFFFF");
-            var unselectedBg = GetStyleString(elementStyle, "background", "#313338");
-            var unselectedColor = GetStyleString(elementStyle, "color", "#E9ECEF");
-
-            for (int i = 0; i < items.Count; i++)
-            {
-                var item = items[i];
-                string key = "";
-                string display = "";
-
-                if (item is string s)
+                var gs = new GUIStyle(GUI.skin.button)
                 {
-                    key = s;
-                    display = s;
-                }
-                else if (item != null)
-                {
-                    var t = item.GetType();
-                    var keyProp = t.GetProperty("key");
-                    var displayProp = t.GetProperty("displayName");
-                    key = keyProp?.GetValue(item)?.ToString() ?? item.ToString();
-                    display = displayProp?.GetValue(item)?.ToString() ?? item.ToString();
-                }
-
-                bool isSelected = key == currentStr;
-                var optStyle = new ImlStyle();
-                optStyle.Setters["background"] = isSelected ? selectedBg : unselectedBg;
-                optStyle.Setters["color"] = isSelected ? selectedColor : unselectedColor;
-                optStyle.Setters["radius"] = GetStyleString(elementStyle, "radius", "8");
-
-                var gs = BuildGuiStyle(optStyle, element);
-                if (GUILayout.Button(display, gs))
-                {
-                    if (!isSelected)
-                    {
-                        changed = true;
-                        newValue = key;
-                    }
-                }
+                    border = new RectOffset(radius, radius, radius, radius),
+                };
+                gs.normal.background = gs.hover.background = gs.active.background = composed;
+                clicked = GUI.Button(r, GUIContent.none, gs);
+                if ((state & ImlStateFlags.Hover) != 0)
+                    DrawHoverOverlay(r, radius, state);
             }
-
-            if (changed)
-            {
-                if (!string.IsNullOrEmpty(valueBinding))
-                    SetContextValue(valueBinding, newValue);
-                if (!string.IsNullOrEmpty(onChanged))
-                    ScheduleEffect(() => InvokeHandler(onChanged, newValue));
-            }
-        }
-
-        private IrrIconStyle GetIconStyle(ImlElement element)
-        {
-            var typeAttr = element.GetString("type");
-            return typeAttr?.ToLowerInvariant() switch
-            {
-                "information" => IrrIconStyle.Information,
-                "success" => IrrIconStyle.Success,
-                "warning" => IrrIconStyle.Warning,
-                "error" => IrrIconStyle.Error,
-                "stop" => IrrIconStyle.Stop,
-                _ => IrrIconStyle.Information
-            };
-        }
-
-        private void HandleElementEvents(ImlElement element)
-        {
-            foreach (var kv in element.Attributes)
-            {
-                if (kv.Key.StartsWith("on-") && !kv.Key.StartsWith("data-on-"))
-                {
-                    var handlerSpec = ResolveAttributeValue(element, kv.Key);
-                    if (!string.IsNullOrEmpty(handlerSpec))
-                        InvokeHandlerString(handlerSpec);
-                }
-            }
-        }
-
-        private void InvokeHandlerString(string handlerSpec)
-        {
-            string handlerName = handlerSpec;
-            string stringArg = null;
-            var parenIdx = handlerSpec.IndexOf('(');
-            if (parenIdx > 0 && handlerSpec.EndsWith(")"))
-            {
-                handlerName = handlerSpec.Substring(0, parenIdx).Trim();
-                var argStr = handlerSpec.Substring(parenIdx + 1, handlerSpec.Length - parenIdx - 2).Trim();
-                if ((argStr.StartsWith("'") && argStr.EndsWith("'")) ||
-                    (argStr.StartsWith("\"") && argStr.EndsWith("\"")))
-                {
-                    stringArg = argStr.Substring(1, argStr.Length - 2);
-                }
-                else if (!string.IsNullOrEmpty(argStr))
-                {
-                    var evalResult = _evaluator.Evaluate(argStr);
-                    stringArg = evalResult?.ToString();
-                }
-            }
-            if (stringArg != null)
-                InvokeHandler(handlerName, stringArg);
             else
-                InvokeHandler(handlerName, null);
+            {
+                clicked = GUI.Button(r, GUIContent.none, GetButtonStyle(style));
+                GUI.DrawTexture(r, GuiTextureFactory.GetArrow(sz, dir, arrowC));
+            }
+
+            if (clicked) _rt.HandleElementEvents(node.Element);
         }
 
-        private void InvokeCommand(string commandPath)
+        private void DrawLink(ImlNode node, Rect r, ImlStyle style, ImlStateFlags state)
         {
-            if (string.IsNullOrEmpty(commandPath))
+            bool hover = (state & ImlStateFlags.Hover) != 0;
+            Color color = hover
+                ? Color.white
+                : StyleValues.GetColor(style, "color", Hex("#D973A5"));
+            color.a *= StyleValues.GetFloat(style, "opacity", 1f);
+
+            var gs = GetLinkStyle(style, color);
+            GUI.Label(r, node.Text ?? "", gs);
+
+            // underline (IMGUI rich text has no <u>)
+            var size = gs.CalcSize(new GUIContent(node.Text ?? ""));
+            float w = Mathf.Min(size.x, r.width);
+            if (w > 1f)
+                DrawFlat(new Rect(r.x, r.y + r.height - 2f, w, 1f), color);
+
+            if (GUI.Button(r, GUIContent.none, GUIStyle.none) &&
+                !string.IsNullOrEmpty(node.Url))
+            {
+                Application.OpenURL(node.Url);
+            }
+        }
+
+        private static GuiTextureFactory.IconSymbol MapIcon(string type)
+            => type switch
+            {
+                "success" => GuiTextureFactory.IconSymbol.Success,
+                "warning" => GuiTextureFactory.IconSymbol.Warning,
+                "error" => GuiTextureFactory.IconSymbol.Error,
+                "stop" => GuiTextureFactory.IconSymbol.Stop,
+                _ => GuiTextureFactory.IconSymbol.Information,
+            };
+
+        private static bool HasEvents(ImlElement el)
+        {
+            if (el == null) return false;
+            foreach (var kv in el.Attributes)
+                if (kv.Key.StartsWith("on-", StringComparison.Ordinal) &&
+                    !kv.Key.StartsWith("data-on-", StringComparison.Ordinal))
+                    return true;
+            return false;
+        }
+
+        // ── shape/style helpers ─────────────────────────────────────────────
+
+        private static bool IsHidden(ImlNode node)
+            => string.Equals(StyleValues.GetStr(node.Style, "display", ""),
+                "none", StringComparison.OrdinalIgnoreCase);
+
+        /// <summary>Draw the element's background color (+ border/radius) if set.</summary>
+        private void DrawBackground(Rect r, ImlStyle style)
+        {
+            if (style == null) return;
+            if (!style.Setters.TryGetValue("background", out var bg) || string.IsNullOrEmpty(bg)) return;
+            if (!StyleValues.TryParseColor(bg, out var color)) return;
+            float opacity = StyleValues.GetFloat(style, "opacity", 1f);
+            color.a *= opacity;
+            int radius = Mathf.Max(0, Mathf.RoundToInt(StyleValues.GetFloat(style, "radius", 0f)));
+            float bw = StyleValues.GetFloat(style, "borderWidth", 0f);
+            Color? border = null;
+            if (bw > 0f && StyleValues.TryParseColor(StyleValues.GetStr(style, "borderColor", ""), out var bc))
+            {
+                bc.a *= opacity;
+                border = bc;
+            }
+            DrawShape(r, radius, color, border, Mathf.RoundToInt(bw));
+        }
+
+        private static void DrawFlat(Rect r, Color c)
+        {
+            if (r.width <= 0f || r.height <= 0f) return;
+            var prev = GUI.color;
+            GUI.color = c;
+            GUI.DrawTexture(r, Texture2D.whiteTexture);
+            GUI.color = prev;
+        }
+
+        private void DrawHoverOverlay(Rect r, int radius, ImlStateFlags state)
+        {
+            if ((state & ImlStateFlags.Hover) == 0) return;
+            float a = (state & ImlStateFlags.Press) != 0 ? 0.14f : 0.07f;
+            DrawShape(r, radius, new Color(1f, 1f, 1f, a), null, 0);
+        }
+
+        /// <summary>Draw a rounded rect via a 9-sliced GUI style (no corner
+        /// distortion at any size, one cached texture per shape).</summary>
+        private void DrawShape(Rect r, int radius, Color fill, Color? border, int borderWidth)
+        {
+            if (r.width <= 0f || r.height <= 0f) return;
+            if (radius <= 0)
+            {
+                DrawFlat(r, fill);
                 return;
-
-            var command = _evaluator.Evaluate(commandPath);
-            if (command is System.Windows.Input.ICommand cmd && cmd.CanExecute(null))
-            {
-                cmd.Execute(null);
             }
+            GUI.Box(r, GUIContent.none, GetBoxStyle(radius, fill, border, borderWidth));
         }
 
-        private void InvokeHandler(string handlerName, object parameter)
+        private GUIStyle GetBoxStyle(int radius, Color fill, Color? border, int borderWidth)
         {
-            if (string.IsNullOrEmpty(handlerName))
-                return;
+            var key = $"box|{radius}|{fill.r:F3},{fill.g:F3},{fill.b:F3},{fill.a:F3}|" +
+                      (border.HasValue
+                          ? $"{border.Value.r:F3},{border.Value.g:F3},{border.Value.b:F3},{border.Value.a:F3}"
+                          : "-") + "|" + borderWidth;
+            if (_boxStyles.TryGetValue(key, out var cached)) return cached;
 
-            if (_handlers.TryGetValue(handlerName, out var handler))
+            int size = Mathf.Max(radius * 2 + 8, 16);
+            var tex = GuiTextureFactory.GetRoundedRect(size, size, radius, fill, border, borderWidth);
+            var gs = new GUIStyle
             {
-                handler();
-            }
-            else if (_genericHandlers.TryGetValue(handlerName, out var genericHandler))
-            {
-                genericHandler(parameter);
-            }
-        }
-
-        private void ScheduleEffect(Action effect)
-        {
-            if (!_pendingEffects.Contains(effect))
-            {
-                _pendingEffects.Add(effect);
-                _effectsScheduled = true;
-            }
-        }
-
-        private void ProcessPendingEffects()
-        {
-            foreach (var effect in _pendingEffects)
-            {
-                try
-                {
-                    effect();
-                }
-                catch (Exception ex)
-                {
-                    Debug.LogError($"[Iris.Iml] Effect error: {ex.Message}");
-                }
-            }
-            _pendingEffects.Clear();
-        }
-
-        private void OnDataContextPropertyChanged(string propertyPath, object oldValue, object newValue)
-        {
-            Debug.Log($"[Iris.Iml] Property changed: {propertyPath} = {newValue}");
-        }
-
-        private ImlStyle GetEffectiveStyle(ImlElement element)
-        {
-            var merged = new ImlStyle();
-            var tag = element.TagName?.ToLowerInvariant();
-            var cls = element.GetString("class")?.ToLowerInvariant();
-            var id = element.GetString("id")?.ToLowerInvariant();
-
-            // 1. Selector-based styles (sorted by specificity ascending)
-            foreach (var ss in _selectorStyles)
-            {
-                if (ss.Selector != null && ss.Selector.Matches(tag, cls, id))
-                    foreach (var kv in ss.Setters)
-                        merged.Setters[kv.Key] = kv.Value;
-            }
-
-            // 2. Named style from cache (via style="name")
-            if (element.Attributes.TryGetValue("style", out var styleAttr))
-            {
-                if (styleAttr.Type == AttributeType.String || styleAttr.Type == AttributeType.Expression)
-                {
-                    var styleName = ResolveAttributeValue(element, "style");
-                    if (!string.IsNullOrEmpty(styleName) && _styleCache.TryGetValue(styleName.ToLowerInvariant(), out var namedStyle))
-                        foreach (var kv in namedStyle.Setters)
-                            merged.Setters[kv.Key] = kv.Value;
-                }
-                // 3. Inline StyleObject: style={{ key: value, ... }}
-                else if (styleAttr.Type == AttributeType.StyleObject && styleAttr.StyleEntries != null)
-                {
-                    foreach (var entry in styleAttr.StyleEntries)
-                        if (!string.IsNullOrEmpty(entry.Property))
-                            merged.Setters[entry.Property] = entry.Value;
-                }
-            }
-
-            return merged;
-        }
-
-        private GUILayoutOption[] GetStyleOptions(ImlStyle style)
-        {
-            var options = new List<GUILayoutOption>();
-
-            if (style.Setters.TryGetValue("width", out var widthStr) && int.TryParse(widthStr, out var width))
-                options.Add(GUILayout.Width(width));
-
-            if (style.Setters.TryGetValue("height", out var heightStr) && int.TryParse(heightStr, out var height))
-                options.Add(GUILayout.Height(height));
-
-            if (style.Setters.TryGetValue("minWidth", out var minW) && int.TryParse(minW, out var minWidth))
-                options.Add(GUILayout.MinWidth(minWidth));
-
-            if (style.Setters.TryGetValue("maxWidth", out var maxW) && int.TryParse(maxW, out var maxWidth))
-                options.Add(GUILayout.MaxWidth(maxWidth));
-
-            if (style.Setters.TryGetValue("minHeight", out var minH) && int.TryParse(minH, out var minHeight))
-                options.Add(GUILayout.MinHeight(minHeight));
-
-            if (style.Setters.TryGetValue("maxHeight", out var maxH) && int.TryParse(maxH, out var maxHeight))
-                options.Add(GUILayout.MaxHeight(maxHeight));
-
-            options.Add(GUILayout.ExpandWidth(!style.Setters.ContainsKey("width")));
-            options.Add(GUILayout.ExpandHeight(!style.Setters.ContainsKey("height")));
-
-            return options.ToArray();
-        }
-
-        private Color GetColor(string hex)
-        {
-            if (string.IsNullOrEmpty(hex))
-                return Color.white;
-
-            if (hex.StartsWith("#"))
-            {
-                hex = hex.Substring(1);
-                if (hex.Length >= 6)
-                {
-                    var r = Convert.ToByte(hex.Substring(0, 2), 16) / 255f;
-                    var g = Convert.ToByte(hex.Substring(2, 2), 16) / 255f;
-                    var b = Convert.ToByte(hex.Substring(4, 2), 16) / 255f;
-                    float a = hex.Length >= 8 ? Convert.ToByte(hex.Substring(6, 2), 16) / 255f : 1f;
-                    return new Color(r, g, b, a);
-                }
-            }
-
-            return Color.white;
-        }
-
-        private static Color MultiplyColor(Color c, float factor)
-        {
-            return new Color(c.r * factor, c.g * factor, c.b * factor, c.a);
-        }
-
-        private string GetStyleString(ImlStyle style, string key, string fallback = "")
-        {
-            return style.Setters.TryGetValue(key, out var v) ? v : fallback;
-        }
-
-        private int GetStyleInt(ImlStyle style, string key, int fallback = 0)
-        {
-            if (style.Setters.TryGetValue(key, out var v) && int.TryParse(v, out var n))
-                return n;
-            return fallback;
-        }
-
-        private float GetStyleFloat(ImlStyle style, string key, float fallback = 0f)
-        {
-            if (style.Setters.TryGetValue(key, out var v) && float.TryParse(v, out var n))
-                return n;
-            return fallback;
-        }
-
-        private GUIStyle BuildGuiStyle(ImlStyle style, ImlElement element)
-        {
-            string tag = element?.TagName?.ToLowerInvariant() ?? "";
-            string cls = element?.GetString("class")?.ToLowerInvariant() ?? "";
-
-            string bgHex = GetStyleString(style, "background", "");
-            string colorHex = GetStyleString(style, "color", "");
-            string borderHex = GetStyleString(style, "borderColor", "");
-            int radius = GetStyleInt(style, "radius");
-            int borderWidth = GetStyleInt(style, "borderWidth");
-            int fontSize = GetStyleInt(style, "fontSize");
-            int marginVal = GetStyleInt(style, "margin");
-            int paddingVal = GetStyleInt(style, "padding");
-
-            string cacheKey = $"{tag}.{cls}.bg:{bgHex}.cl:{colorHex}.bd:{borderHex}.r:{radius}.bw:{borderWidth}.fs:{fontSize}.m:{marginVal}.p:{paddingVal}";
-            if (_guiStyleCache.TryGetValue(cacheKey, out var cached))
-                return cached;
-
-            var gs = new GUIStyle();
-            gs.richText = true;
-            gs.wordWrap = true;
-            gs.clipping = TextClipping.Overflow;
-
-            if (fontSize > 0) gs.fontSize = fontSize;
-            if (!string.IsNullOrEmpty(colorHex)) gs.normal.textColor = GetColor(colorHex);
-
-            if (marginVal > 0) gs.margin = new RectOffset(marginVal, marginVal, marginVal, marginVal);
-            if (paddingVal > 0) gs.padding = new RectOffset(paddingVal, paddingVal, paddingVal, paddingVal);
-
-            if (!string.IsNullOrEmpty(bgHex))
-            {
-                Color bg = GetColor(bgHex);
-                int texSize = Mathf.Max(2 * radius + 2, 16);
-                Color? borderCol = !string.IsNullOrEmpty(borderHex) ? GetColor(borderHex) : null;
-
-                gs.normal.background = GuiTextureFactory.GetRoundedRect(texSize, texSize, radius, bg, borderCol, borderWidth);
-                gs.hover.background = GuiTextureFactory.GetRoundedRect(texSize, texSize, radius, MultiplyColor(bg, 1.08f), borderCol, borderWidth);
-                gs.active.background = GuiTextureFactory.GetRoundedRect(texSize, texSize, radius, MultiplyColor(bg, 0.88f), borderCol, borderWidth);
-
-                if (radius > 0)
-                    gs.border = new RectOffset(radius, radius, radius, radius);
-            }
-
-            _guiStyleCache[cacheKey] = gs;
+                normal = { background = tex },
+                border = new RectOffset(radius, radius, radius, radius),
+            };
+            _boxStyles[key] = gs;
             return gs;
         }
 
-        private GUIStyle BuildTextStyle(ImlStyle style, ImlElement element)
+        private GUIStyle GetTextStyle(ImlStyle style)
         {
-            string tag = element?.TagName?.ToLowerInvariant() ?? "";
-            string cls = element?.GetString("class")?.ToLowerInvariant() ?? "";
-            string colorHex = GetStyleString(style, "color", "");
-            int fontSize = GetStyleInt(style, "fontSize");
+            int fontSize = Mathf.RoundToInt(StyleValues.GetFloat(style, "fontSize", 13f));
+            var align = StyleValues.GetStr(style, "textAlign", "left").ToLowerInvariant();
+            bool wrap = !string.Equals(StyleValues.GetStr(style, "whiteSpace", "normal"),
+                "nowrap", StringComparison.OrdinalIgnoreCase);
+            bool bold = IsBold(style);
+            var color = StyleValues.GetColor(style, "color", Hex("#E9ECEF"));
+            color.a *= StyleValues.GetFloat(style, "opacity", 1f);
 
-            string cacheKey = $"txt.{cls}.cl:{colorHex}.fs:{fontSize}";
-            if (_guiStyleCache.TryGetValue(cacheKey, out var cached))
-                return cached;
+            var key = $"text|{fontSize}|{align}|{wrap}|{bold}|{color.r:F3},{color.g:F3},{color.b:F3},{color.a:F3}";
+            if (_textStyles.TryGetValue(key, out var cached)) return cached;
 
-            var gs = new GUIStyle();
-            gs.richText = true;
-            gs.wordWrap = true;
-            gs.clipping = TextClipping.Overflow;
-            gs.alignment = TextAnchor.MiddleLeft;
-
-            if (fontSize > 0) gs.fontSize = fontSize;
-            if (!string.IsNullOrEmpty(colorHex)) gs.normal.textColor = GetColor(colorHex);
-
-            _guiStyleCache[cacheKey] = gs;
+            var gs = new GUIStyle(GUI.skin.label)
+            {
+                fontSize = fontSize,
+                wordWrap = wrap,
+                richText = false,
+                fontStyle = bold ? FontStyle.Bold : FontStyle.Normal,
+                alignment = align switch
+                {
+                    "center" => TextAnchor.MiddleCenter,
+                    "right" => TextAnchor.MiddleRight,
+                    _ => TextAnchor.MiddleLeft,
+                },
+            };
+            gs.normal.textColor = gs.hover.textColor = gs.active.textColor = color;
+            _textStyles[key] = gs;
             return gs;
         }
 
-        private Texture2D LoadTexture(string path)
+        private GUIStyle GetLinkStyle(ImlStyle style, Color color)
         {
-            if (string.IsNullOrEmpty(path))
-                return null;
+            int fontSize = Mathf.RoundToInt(StyleValues.GetFloat(style, "fontSize", 13f));
+            var key = $"link|{fontSize}|{color.r:F3},{color.g:F3},{color.b:F3},{color.a:F3}";
+            if (_textStyles.TryGetValue(key, out var cached)) return cached;
 
-            if (_textureCache.TryGetValue(path, out var cached))
-                return cached;
-
-            try
+            var gs = new GUIStyle(GUI.skin.label)
             {
-                Texture2D texture = null;
-
-                if (path.StartsWith("@/") || path.StartsWith("@"))
-                {
-                    var fullPath = _parser.ResolvePath(path);
-                    if (File.Exists(fullPath))
-                    {
-                        var bytes = File.ReadAllBytes(fullPath);
-                        texture = new Texture2D(1, 1);
-                        texture.LoadImage(bytes);
-                    }
-                }
-                else if (path.StartsWith("bundle://"))
-                {
-                    var bundlePath = path.Substring(9);
-                    // AssetBundle loading would go here
-                }
-                else if (path.StartsWith("addr://"))
-                {
-                    // Addressables loading would go here
-                }
-
-                if (texture != null)
-                    _textureCache[path] = texture;
-
-                return texture;
-            }
-            catch (Exception ex)
-            {
-                Debug.LogWarning($"[Iris.Iml] Failed to load texture: {path} - {ex.Message}");
-                return null;
-            }
+                fontSize = fontSize,
+                wordWrap = false,
+                richText = false,
+            };
+            gs.normal.textColor = gs.hover.textColor = gs.active.textColor = color;
+            _textStyles[key] = gs;
+            return gs;
         }
-    }
 
-    public class ImlStyle
-    {
-        public string Name { get; set; }
-        public string Extends { get; set; }
-        public StyleSelector Selector { get; set; }
-        public Dictionary<string, string> Setters { get; set; } = new();
-    }
-
-    namespace RendererInternal
+        private GUIStyle GetButtonStyle(ImlStyle style)
         {
-            public class DrawArgs
+            int fontSize = Mathf.RoundToInt(StyleValues.GetFloat(style, "fontSize", 13f));
+            bool bold = IsBold(style);
+            var bg = StyleValues.GetColor(style, "background", Hex("#313338"));
+            var text = StyleValues.GetColor(style, "color", Hex("#E9ECEF"));
+            float opacity = StyleValues.GetFloat(style, "opacity", 1f);
+            bg.a *= opacity; text.a *= opacity;
+            int radius = Mathf.Max(0, Mathf.RoundToInt(StyleValues.GetFloat(style, "radius", 8f)));
+            float bw = StyleValues.GetFloat(style, "borderWidth", 0f);
+            Color? border = null;
+            if (bw > 0f && StyleValues.TryParseColor(StyleValues.GetStr(style, "borderColor", ""), out var bc))
             {
-                public object Context { get; set; }
+                bc.a *= opacity;
+                border = bc;
             }
+            int bwI = Mathf.RoundToInt(bw);
+            int padL = Mathf.RoundToInt(StyleValues.GetFloat(style, "paddingLeft", 10f));
+            int padR = Mathf.RoundToInt(StyleValues.GetFloat(style, "paddingRight", 10f));
+            int padT = Mathf.RoundToInt(StyleValues.GetFloat(style, "paddingTop", 6f));
+            int padB = Mathf.RoundToInt(StyleValues.GetFloat(style, "paddingBottom", 6f));
+
+            var key = $"btn|{fontSize}|{bold}|{bg.r:F3},{bg.g:F3},{bg.b:F3},{bg.a:F3}|" +
+                      $"{text.r:F3},{text.g:F3},{text.b:F3},{text.a:F3}|{radius}|{bwI}|" +
+                      (border.HasValue
+                          ? $"{border.Value.r:F3},{border.Value.g:F3},{border.Value.b:F3},{border.Value.a:F3}"
+                          : "-") + $"|{padL},{padR},{padT},{padB}";
+            if (_buttonStyles.TryGetValue(key, out var cached)) return cached;
+
+            var gs = new GUIStyle(GUI.skin.button)
+            {
+                fontSize = fontSize,
+                wordWrap = false,
+                fontStyle = bold ? FontStyle.Bold : FontStyle.Normal,
+                alignment = TextAnchor.MiddleCenter,
+                padding = new RectOffset(padL, padR, padT, padB),
+            };
+            if (radius > 0)
+            {
+                int size = Mathf.Max(radius * 2 + 8, 16);
+                gs.normal.background = GuiTextureFactory.GetRoundedRect(size, size, radius, bg, border, bwI);
+                gs.hover.background = GuiTextureFactory.GetRoundedRect(size, size, radius,
+                    StyleValues.Multiply(bg, 1.35f), border, bwI);
+                gs.active.background = GuiTextureFactory.GetRoundedRect(size, size, radius,
+                    StyleValues.Multiply(bg, 0.7f), border, bwI);
+                gs.border = new RectOffset(radius, radius, radius, radius);
+            }
+            gs.focused.background = gs.hover.background;
+            gs.normal.textColor = gs.hover.textColor = gs.active.textColor = gs.focused.textColor = text;
+            _buttonStyles[key] = gs;
+            return gs;
         }
+
+        private GUIStyle GetFieldStyle(ImlStyle style)
+        {
+            int fontSize = Mathf.RoundToInt(StyleValues.GetFloat(style, "fontSize", 13f));
+            var bg = StyleValues.GetColor(style, "background", Hex("#151719"));
+            var border = StyleValues.GetColor(style, "borderColor", Hex("#222326"));
+            var focus = StyleValues.GetColor(style, "focusBorder", Hex("#D973A5"));
+            var text = StyleValues.GetColor(style, "color", Hex("#E9ECEF"));
+            float opacity = StyleValues.GetFloat(style, "opacity", 1f);
+            bg.a *= opacity; border.a *= opacity; focus.a *= opacity; text.a *= opacity;
+            int radius = Mathf.Max(0, Mathf.RoundToInt(StyleValues.GetFloat(style, "radius", 8f)));
+            int bw = Mathf.Max(0, Mathf.RoundToInt(StyleValues.GetFloat(style, "borderWidth", 1f)));
+
+            var key = $"field|{fontSize}|{bg.r:F3},{bg.g:F3},{bg.b:F3},{bg.a:F3}|" +
+                      $"{focus.r:F3},{focus.g:F3},{focus.b:F3},{focus.a:F3}|{radius}|{bw}|" +
+                      $"{text.r:F3},{text.g:F3},{text.b:F3},{text.a:F3}";
+            if (_fieldStyles.TryGetValue(key, out var cached)) return cached;
+
+            var gs = new GUIStyle(GUI.skin.textField)
+            {
+                fontSize = fontSize,
+                alignment = TextAnchor.MiddleLeft,
+                padding = new RectOffset(6, 6, 4, 4),
+                richText = false,
+            };
+            if (radius > 0)
+            {
+                int size = Mathf.Max(radius * 2 + 8, 16);
+                var normalTex = GuiTextureFactory.GetRoundedRect(size, size, radius, bg, border, bw);
+                var focusTex = GuiTextureFactory.GetRoundedRect(size, size, radius, bg, focus, bw);
+                gs.normal.background = gs.hover.background = normalTex;
+                gs.active.background = gs.focused.background = focusTex;
+                gs.border = new RectOffset(radius, radius, radius, radius);
+            }
+            gs.normal.textColor = gs.hover.textColor = gs.active.textColor = gs.focused.textColor = text;
+            _fieldStyles[key] = gs;
+            return gs;
+        }
+
+        private static bool IsBold(ImlStyle style)
+        {
+            var weight = StyleValues.GetStr(style, "fontWeight", "");
+            if (weight == "bold" || weight == "700" || weight == "800" || weight == "900")
+                return true;
+            var fs = StyleValues.GetStr(style, "fontStyle", "");
+            return fs == "bold";
+        }
+
+        private static Color Hex(string s)
+            => StyleValues.TryParseColor(s, out var c) ? c : Color.white;
+    }
 }

@@ -1,48 +1,1220 @@
 using System;
-using System.Collections;
 using System.Collections.Generic;
-using System.Drawing.Drawing2D;
-using System.Drawing.Imaging;
-using System.IO;
-using System.Linq;
-using System.Runtime.InteropServices;
 using UnityEngine;
+using UnityEngine.EventSystems;
 using UnityEngine.UI;
-using SD = System.Drawing;
 
 namespace Iris.Iml
 {
+    /// <summary>
+    /// UGUI backend. On <see cref="Rebuild"/> it builds the shared
+    /// <see cref="ImlNode"/> tree, runs the shared <see cref="LayoutEngine"/>,
+    /// then creates one GameObject per node positioned at the produced rects
+    /// (top-left anchored, y-down converted). No LayoutGroups — every rect
+    /// comes from the shared layout engine, so IMGUI and UGUI share one
+    /// implementation of style + layout.
+    /// </summary>
     public class IrisGoRenderer : IImlRenderer
     {
-        private readonly ImlParser _parser = new();
-        private ImlDocument _document;
-        private IBindingContext _dataContext;
-        private ExpressionEvaluator _evaluator;
-        private readonly Dictionary<string, Action> _handlers = new();
-        private readonly Dictionary<string, Action<object>> _genericHandlers = new();
-        private readonly Dictionary<string, Action<Rect, RendererInternal.DrawArgs>> _drawHandlers = new();
-        private readonly Dictionary<string, Texture2D> _textureCache = new();
-        private readonly Dictionary<string, ImlStyle> _styleCache = new();
-        private readonly List<ImlStyle> _selectorStyles = new();
-        private readonly Dictionary<string, Func<object[], object>> _registeredFunctions = new();
-        private readonly HashSet<string> _parsedRefs = new();
+        private readonly ImlRuntime _rt = new() { DeferEffects = false };
 
-        private IIrrLayout _layout;
         private GameObject _rootObject;
-        private readonly Dictionary<string, GameObject> _elementMap = new();
-        private bool _dirty = true;
+        private GameObject _wrapper;
+        private readonly Dictionary<GameObject, ImlNode> _interactive = new();
+        private readonly List<RaycastResult> _rayResults = new();
+        private ImlNode _hovered;
+        private ImlNode _pressed;
+        private Text _measurer;
         private Font _defaultFont;
 
-        public string CurrentFilePath { get; private set; }
-        public Action<string> LogDelegate { get; set; }
+        private static Sprite _flatSprite;
+        private static readonly Dictionary<int, Sprite> _roundedSpriteCache = new();
+        private static readonly Dictionary<string, Sprite> _bakedSpriteCache = new();
 
-        /// <summary>Set the root transform to parent UI under (e.g. a Canvas).</summary>
-        public GameObject RootObject { get => _rootObject; set => _rootObject = value; }
+        // ── IImlRenderer passthrough ────────────────────────────────────────
 
-        public void SetLayout(IIrrLayout layout) => _layout = layout;
+        public string CurrentFilePath => _rt.CurrentFilePath;
 
-        /// <summary>Optional parent transform for the root Canvas. If set, Canvas will be parented here.</summary>
+        public Action<string> LogDelegate
+        {
+            get => _rt.LogDelegate;
+            set => _rt.LogDelegate = value;
+        }
+
+        public void SetDataContext(object data) => _rt.SetDataContext(data);
+
+        public void SetContextValue(string propertyPath, object value)
+            => _rt.SetContextValue(propertyPath, value);
+
+        public void RegisterHandler(string name, Action handler)
+            => _rt.RegisterHandler(name, handler);
+
+        public void RegisterHandler(string name, Action<object> handler)
+            => _rt.RegisterHandler(name, handler);
+
+        public void RegisterHandler<T>(string name, Action<T> handler)
+            => _rt.RegisterHandler(name, handler);
+
+        public void RegisterFunction(string name, Func<object[], object> func)
+            => _rt.RegisterFunction(name, func);
+
+        public void RegisterDrawHandler(string name, Action<Rect, RendererInternal.DrawArgs> handler)
+            => _rt.RegisterDrawHandler(name, handler);
+
+        public void SetHotReload(bool enabled) => _rt.SetHotReload(enabled);
+
+        public void LoadFile(string filePath) => _rt.LoadFile(filePath);
+
+        public void LoadContent(string imlContent, string basePath = "")
+            => _rt.LoadContent(imlContent, basePath);
+
+        public void Render(string filePath)
+        {
+            if (!string.Equals(_rt.CurrentFilePath, filePath, StringComparison.Ordinal))
+                _rt.LoadFile(filePath);
+            Rebuild();
+        }
+
+        public void OnGUI() { } // IMGUI-only interface member
+
+        // ── UGUI surface ────────────────────────────────────────────────────
+
+        public GameObject RootObject
+        {
+            get => _rootObject;
+            set => _rootObject = value;
+        }
+
         public Transform ParentTransform { get; set; }
+
+        /// <summary>
+        /// Optional explicit root size. When set, the layout root is forced to
+        /// exactly this size and the wrapper is sized to match — consumers can
+        /// then pin the wrapper wherever they want (e.g. a 400×50 status bar).
+        /// </summary>
+        public Vector2? RootSizeOverride { get; set; }
+
+        public void Rebuild()
+        {
+            _rt.Dirty = false;
+            _hovered = null;
+            _pressed = null;
+
+            if (_rt.Document?.Root == null || _rt.DataContext == null)
+            {
+                Log("Rebuild skipped: document or dataContext null");
+                return;
+            }
+
+            ImlNode root;
+            try { root = _rt.BuildTree(); }
+            catch (Exception ex) { Debug.LogError($"[Iris.Iml] Build failed: {ex}"); return; }
+            if (root == null) return;
+
+            try
+            {
+                LayoutEngine.Layout(root, new LayoutConstraints
+                {
+                    AvailWidth = RootSizeOverride?.x ?? Screen.width,
+                    AvailHeight = 0f,
+                    RootStretchWidth = false,                 // content-sized root
+                    ApplyScroll = false,                      // ScrollRect moves content
+                    MeasureText = MeasureUGUIText,
+                    RootWidth = RootSizeOverride?.x ?? -1f,
+                    RootHeight = RootSizeOverride?.y ?? -1f,
+                });
+            }
+            catch (Exception ex) { Debug.LogError($"[Iris.Iml] Layout failed: {ex}"); return; }
+
+            var rootTf = EnsureRoot();
+            var rootSize = new Vector2(root.Rect.width, root.Rect.height);
+
+            // Destroy old children, keep index 0 (overlay / consumer placeholder)
+            for (int i = rootTf.childCount - 1; i >= 1; i--)
+                UnityEngine.Object.Destroy(rootTf.GetChild(i).gameObject);
+
+            _wrapper = new GameObject("DialogWrapper", typeof(RectTransform));
+            var wRect = (RectTransform)_wrapper.transform;
+            wRect.anchorMin = new Vector2(0.5f, 0.5f);
+            wRect.anchorMax = new Vector2(0.5f, 0.5f);
+            wRect.pivot = new Vector2(0.5f, 0.5f);
+            wRect.anchoredPosition = Vector2.zero;
+            wRect.sizeDelta = rootSize;
+            _wrapper.transform.SetParent(rootTf, false);
+
+            _interactive.Clear();
+            BuildChildren(root, wRect, root.Rect);
+
+            // interaction driver lives on the canvas so it survives rebuilds
+            if (_rootObject.GetComponent<ImlDriver>() == null)
+            {
+                var d = _rootObject.AddComponent<ImlDriver>();
+                d.Owner = this;
+            }
+        }
+
+        /// <summary>Called by the driver each frame: rebuild on dirty + hover tracking.</summary>
+        internal void Tick()
+        {
+            if (_rt.Dirty) Rebuild();
+            UpdatePointerState();
+        }
+
+        private Transform EnsureRoot()
+        {
+            if (_rootObject == null)
+            {
+                _rootObject = new GameObject("IrisCanvas");
+                if (ParentTransform != null)
+                    _rootObject.transform.SetParent(ParentTransform, false);
+                else
+                    UnityEngine.Object.DontDestroyOnLoad(_rootObject);
+
+                var canvas = _rootObject.AddComponent<Canvas>();
+                canvas.renderMode = RenderMode.ScreenSpaceOverlay;
+                canvas.sortingOrder = 32767;
+                _rootObject.AddComponent<CanvasScaler>();
+                _rootObject.AddComponent<GraphicRaycaster>();
+
+                // Full-screen modal overlay (renderer-created canvases only).
+                var bgGo = new GameObject("OverlayBG", typeof(RectTransform));
+                var bgImg = bgGo.GetComponent<Image>();
+                bgImg.color = new Color(0f, 0f, 0f, 0.5f);
+                bgImg.raycastTarget = true;
+                bgImg.rectTransform.anchorMin = Vector2.zero;
+                bgImg.rectTransform.anchorMax = Vector2.one;
+                bgImg.rectTransform.sizeDelta = Vector2.zero;
+                bgGo.transform.SetParent(_rootObject.transform, false);
+            }
+            else
+            {
+                // Consumer-provided canvas: make sure it can receive events.
+                if (_rootObject.GetComponent<Canvas>() == null)
+                {
+                    var canvas = _rootObject.AddComponent<Canvas>();
+                    canvas.renderMode = RenderMode.ScreenSpaceOverlay;
+                }
+                if (_rootObject.GetComponent<GraphicRaycaster>() == null)
+                    _rootObject.AddComponent<GraphicRaycaster>();
+            }
+            return _rootObject.transform;
+        }
+
+        // ── build helpers ───────────────────────────────────────────────────
+
+        private static string Name(ImlNode node)
+            => string.IsNullOrEmpty(node.Tag) ? node.Kind.ToString() : node.Tag;
+
+        /// <summary>Top-left anchored placement: layout (x, y-down) → UGUI (y-up).</summary>
+        private static void PlaceChild(RectTransform rt, Rect rect, Rect parentRect)
+        {
+            rt.anchorMin = new Vector2(0f, 1f);
+            rt.anchorMax = new Vector2(0f, 1f);
+            rt.pivot = new Vector2(0f, 1f);
+            rt.sizeDelta = new Vector2(rect.width, rect.height);
+            rt.anchoredPosition = new Vector2(
+                rect.x - parentRect.x,
+                -(rect.y - parentRect.y));
+        }
+
+        private RectTransform CreateGO(ImlNode node, Transform parent, Rect parentRect)
+        {
+            var go = new GameObject(Name(node), typeof(RectTransform));
+            var rt = (RectTransform)go.transform;
+            rt.SetParent(parent, false);
+            PlaceChild(rt, node.Rect, parentRect);
+            node.Payload = new UiRefs { Root = go };
+            return rt;
+        }
+
+        private void BuildChildren(ImlNode parent, Transform tf, Rect parentRect)
+        {
+            foreach (var c in parent.BgChildren) BuildNode(c, tf, parentRect);
+            foreach (var c in parent.Children) BuildNode(c, tf, parentRect);
+            foreach (var c in parent.FgChildren) BuildNode(c, tf, parentRect);
+        }
+
+        private void BuildNode(ImlNode node, Transform parent, Rect parentRect)
+        {
+            if (node == null) return;
+            switch (node.Kind)
+            {
+                case ImlNodeKind.Box:
+                case ImlNodeKind.Root:
+                    BuildBox(node, parent, parentRect);
+                    break;
+                case ImlNodeKind.ScrollView:
+                    BuildScrollView(node, parent, parentRect);
+                    break;
+                case ImlNodeKind.Text:
+                    BuildText(node, parent, parentRect);
+                    break;
+                case ImlNodeKind.Link:
+                    BuildLink(node, parent, parentRect);
+                    break;
+                case ImlNodeKind.Image:
+                    BuildImage(node, parent, parentRect);
+                    break;
+                case ImlNodeKind.Button:
+                case ImlNodeKind.SelectorOption:
+                    BuildButton(node, parent, parentRect);
+                    break;
+                case ImlNodeKind.Switch:
+                case ImlNodeKind.Checkbox:
+                    BuildToggle(node, parent, parentRect);
+                    break;
+                case ImlNodeKind.Slider:
+                    BuildSlider(node, parent, parentRect);
+                    break;
+                case ImlNodeKind.TextField:
+                case ImlNodeKind.TextArea:
+                    BuildInputField(node, parent, parentRect, multiline: node.Kind == ImlNodeKind.TextArea);
+                    break;
+                case ImlNodeKind.Separator:
+                    BuildSeparator(node, parent, parentRect);
+                    break;
+                case ImlNodeKind.Icon:
+                    BuildIcon(node, parent, parentRect);
+                    break;
+                case ImlNodeKind.ArrowButton:
+                    BuildArrowButton(node, parent, parentRect);
+                    break;
+                // Fill / Spacer / CustomCanvas: pure layout / IMGUI-only → no GO
+            }
+        }
+
+        private void BuildBox(ImlNode node, Transform parent, Rect parentRect)
+        {
+            var rt = CreateGO(node, parent, parentRect);
+            var refs = (UiRefs)node.Payload;
+
+            if (node.Style.Setters.ContainsKey("background"))
+            {
+                refs.Background = rt.gameObject.AddComponent<Image>();
+                refs.Background.raycastTarget = false;
+            }
+            if (string.Equals(StyleValues.GetStr(node.Style, "overflow", ""), "hidden", StringComparison.OrdinalIgnoreCase))
+                rt.gameObject.AddComponent<RectMask2D>();
+
+            ApplyVisual(node, refs, node.Style, node.BuildState);
+            BuildChildren(node, rt, node.Rect);
+        }
+
+        private void BuildText(ImlNode node, Transform parent, Rect parentRect)
+        {
+            var rt = CreateGO(node, parent, parentRect);
+            var refs = (UiRefs)node.Payload;
+            refs.Label = rt.gameObject.AddComponent<Text>();
+            refs.Label.raycastTarget = false;
+            refs.Label.text = node.Text ?? "";
+            refs.Label.font = DefaultFont;
+            refs.Label.supportRichText = node.Element != null &&
+                string.Equals(node.Element.GetString("richText"), "true", StringComparison.OrdinalIgnoreCase);
+            ApplyVisual(node, refs, node.Style, node.BuildState);
+        }
+
+        private void BuildLink(ImlNode node, Transform parent, Rect parentRect)
+        {
+            var rt = CreateGO(node, parent, parentRect);
+            var refs = (UiRefs)node.Payload;
+
+            refs.Background = rt.gameObject.AddComponent<Image>();   // transparent raycast surface
+            refs.Background.color = new Color(0f, 0f, 0f, 0f);
+            refs.Background.raycastTarget = true;
+            refs.Background.sprite = _flatSprite;
+
+            refs.Label = new GameObject("Text", typeof(RectTransform)).AddComponent<Text>();
+            refs.Label.transform.SetParent(rt, false);
+            StretchFull((RectTransform)refs.Label.transform);
+            refs.Label.raycastTarget = false;
+            refs.Label.text = node.Text ?? "";
+            refs.Label.font = DefaultFont;
+
+            // 1px underline strip at the bottom of the text
+            var underline = new GameObject("Underline", typeof(RectTransform));
+            var underlineRT = (RectTransform)underline.transform;
+            underlineRT.SetParent(rt, false);
+            underlineRT.anchorMin = new Vector2(0f, 1f);
+            underlineRT.anchorMax = new Vector2(0f, 1f);
+            underlineRT.pivot = new Vector2(0f, 1f);
+            float textW = MeasureUGUIText(node.Text ?? "",
+                Mathf.RoundToInt(StyleValues.GetFloat(node.Style, "fontSize", 13f)), 0f).x;
+            underlineRT.sizeDelta = new Vector2(Mathf.Min(textW, node.Rect.width), 1f);
+            underlineRT.anchoredPosition = new Vector2(0f, -node.Rect.height + 1f);
+            refs.Symbol = underline.AddComponent<Image>();
+            refs.Symbol.raycastTarget = false;
+            refs.Symbol.sprite = _flatSprite;
+
+            var btn = rt.gameObject.AddComponent<Button>();
+            btn.transition = Selectable.Transition.None;
+            btn.targetGraphic = refs.Background;
+            btn.onClick.AddListener(() =>
+            {
+                if (!string.IsNullOrEmpty(node.Url))
+                    Application.OpenURL(node.Url);
+                _rt.HandleElementEvents(node.Element);
+            });
+
+            _interactive[rt.gameObject] = node;
+            ApplyVisual(node, refs, node.Style, node.BuildState);
+        }
+
+        private void BuildImage(ImlNode node, Transform parent, Rect parentRect)
+        {
+            var rt = CreateGO(node, parent, parentRect);
+            var tex = _rt.LoadTexture(node.Source);
+            if (tex != null)
+            {
+                var raw = rt.gameObject.AddComponent<RawImage>();
+                raw.texture = tex;
+                raw.raycastTarget = false;
+            }
+        }
+
+        private void BuildButton(ImlNode node, Transform parent, Rect parentRect)
+        {
+            var rt = CreateGO(node, parent, parentRect);
+            var refs = (UiRefs)node.Payload;
+
+            refs.Background = rt.gameObject.AddComponent<Image>();
+            refs.Background.raycastTarget = true;
+
+            refs.Label = new GameObject("Text", typeof(RectTransform)).AddComponent<Text>();
+            refs.Label.transform.SetParent(rt, false);
+            StretchFull((RectTransform)refs.Label.transform);
+            refs.Label.raycastTarget = false;
+            refs.Label.text = node.Text ?? "";
+            refs.Label.font = DefaultFont;
+            refs.Label.alignment = TextAnchor.MiddleCenter;
+            refs.Label.horizontalOverflow = HorizontalWrapMode.Overflow;
+            refs.Label.verticalOverflow = VerticalWrapMode.Overflow;
+
+            var btn = rt.gameObject.AddComponent<Button>();
+            btn.transition = Selectable.Transition.None;
+            btn.targetGraphic = refs.Background;
+            var captured = node;
+            btn.onClick.AddListener(() =>
+            {
+                if (captured.Kind == ImlNodeKind.SelectorOption)
+                {
+                    _rt.SetContextValue(captured.ValueBinding, captured.OptionKey);
+                    _rt.ScheduleEffect(() => _rt.InvokeElementEvent(captured.Element, "on-changed", captured.OptionKey));
+                }
+                else
+                {
+                    var cmd = _rt.ResolveAttributeValue(captured.Element, "command");
+                    if (!string.IsNullOrEmpty(cmd)) _rt.InvokeCommand(cmd);
+                    _rt.HandleElementEvents(captured.Element);
+                }
+            });
+
+            _interactive[rt.gameObject] = node;
+            ApplyVisual(node, refs, node.Style, node.BuildState);
+        }
+
+        private void BuildToggle(ImlNode node, Transform parent, Rect parentRect)
+        {
+            var rt = CreateGO(node, parent, parentRect);
+            var refs = (UiRefs)node.Payload;
+            refs.Background = rt.gameObject.AddComponent<Image>();
+            refs.Background.raycastTarget = true;
+
+            var captured = node;
+            var btn = rt.gameObject.AddComponent<Button>();
+            btn.transition = Selectable.Transition.None;
+            btn.targetGraphic = refs.Background;
+            btn.onClick.AddListener(() => OnToggleClick(captured));
+
+            if (node.Kind == ImlNodeKind.Switch)
+            {
+                refs.Knob = new GameObject("Knob", typeof(RectTransform)).AddComponent<Image>();
+                var knobRT = (RectTransform)refs.Knob.transform;
+                knobRT.SetParent(rt, false);
+                knobRT.anchorMin = new Vector2(0f, 0.5f);
+                knobRT.anchorMax = new Vector2(0f, 0.5f);
+                knobRT.pivot = new Vector2(0.5f, 0.5f);
+                refs.Knob.raycastTarget = false;
+                refs.Knob.sprite = GetRoundedSprite(Mathf.Max(4, Mathf.RoundToInt(LayoutEngine.SwitchKnobSize)));
+                refs.Knob.type = Image.Type.Simple;
+            }
+            else
+            {
+                refs.Symbol = new GameObject("Check", typeof(RectTransform)).AddComponent<Image>();
+                var chkRT = (RectTransform)refs.Symbol.transform;
+                chkRT.SetParent(rt, false);
+                StretchFull(chkRT);
+                refs.Symbol.raycastTarget = false;
+                refs.Symbol.sprite = GetTextureSprite(GuiTextureFactory.GetCheckmark(
+                    Mathf.RoundToInt(LayoutEngine.CheckboxSize), Color.white), 0);
+            }
+
+            refs.Overlay = new GameObject("Overlay", typeof(RectTransform)).AddComponent<Image>();
+            var ovRT = (RectTransform)refs.Overlay.transform;
+            ovRT.SetParent(rt, false);
+            StretchFull(ovRT);
+            refs.Overlay.raycastTarget = false;
+            refs.Overlay.color = Color.clear;
+
+            _interactive[rt.gameObject] = node;
+            ApplyVisual(node, refs, node.Style, node.BuildState);
+        }
+
+        private void OnToggleClick(ImlNode node)
+        {
+            var newVal = !node.Checked;
+            if (!string.IsNullOrEmpty(node.ValueBinding))
+            {
+                _rt.SetContextValue(node.ValueBinding, newVal);
+                node.Checked = newVal;
+                if (newVal) node.BuildState |= ImlStateFlags.Checked;
+                else node.BuildState &= ~ImlStateFlags.Checked;
+                ApplyState(node);
+            }
+            _rt.ScheduleEffect(() => _rt.InvokeElementEvent(node.Element, "on-changed", newVal));
+        }
+
+        private void BuildSlider(ImlNode node, Transform parent, Rect parentRect)
+        {
+            var rt = CreateGO(node, parent, parentRect);
+            var refs = (UiRefs)node.Payload;
+            refs.TrackW = Mathf.Max(10f, node.Rect.width -
+                (node.ShowValue ? LayoutEngine.SliderValueBox : 0f));
+
+            // drag surface under everything else
+            var drag = new GameObject("DragArea", typeof(RectTransform));
+            var dragRT = (RectTransform)drag.transform;
+            dragRT.SetParent(rt, false);
+            StretchFull(dragRT);
+            var dragImg = drag.AddComponent<Image>();
+            dragImg.color = new Color(0f, 0f, 0f, 0f);
+            dragImg.raycastTarget = true;
+            dragImg.sprite = _flatSprite;
+            var dragHandler = drag.AddComponent<ImlSliderDrag>();
+            dragHandler.Owner = this;
+            dragHandler.Node = node;
+            dragHandler.Track = null; // assigned below once the track exists
+            _interactive[drag] = node;
+
+            var trackGo = new GameObject("Track", typeof(RectTransform));
+            var trackRT = (RectTransform)trackGo.transform;
+            trackRT.SetParent(rt, false);
+            trackRT.anchorMin = new Vector2(0f, 1f);
+            trackRT.anchorMax = new Vector2(0f, 1f);
+            trackRT.pivot = new Vector2(0f, 1f);
+            float trackH = LayoutEngine.SliderTrackHeight;
+            trackRT.sizeDelta = new Vector2(refs.TrackW, trackH);
+            trackRT.anchoredPosition = new Vector2(0f, -(node.Rect.height - trackH) / 2f);
+            refs.Track = trackRT;
+
+            refs.Background = trackGo.AddComponent<Image>();      // track capsule
+            refs.Background.raycastTarget = false;
+
+            refs.Fill = new GameObject("Fill", typeof(RectTransform)).AddComponent<Image>();
+            var fillRT = (RectTransform)refs.Fill.transform;
+            fillRT.SetParent(trackRT, false);
+            fillRT.anchorMin = new Vector2(0f, 1f);
+            fillRT.anchorMax = new Vector2(0f, 1f);
+            fillRT.pivot = new Vector2(0f, 1f);
+            fillRT.anchoredPosition = Vector2.zero;
+            fillRT.sizeDelta = new Vector2(0f, trackH);
+            refs.Fill.raycastTarget = false;
+
+            refs.Symbol = new GameObject("Handle", typeof(RectTransform)).AddComponent<Image>();
+            var handleRT = (RectTransform)refs.Symbol.transform;
+            handleRT.SetParent(trackRT, false);
+            handleRT.anchorMin = new Vector2(0f, 0.5f);
+            handleRT.anchorMax = new Vector2(0f, 0.5f);
+            handleRT.pivot = new Vector2(0.5f, 0.5f);
+            handleRT.sizeDelta = new Vector2(LayoutEngine.SliderThumbSize, LayoutEngine.SliderThumbSize);
+            refs.Symbol.raycastTarget = false;
+            refs.Symbol.sprite = GetRoundedSprite(Mathf.Max(4, Mathf.RoundToInt(LayoutEngine.SliderThumbSize / 2f)));
+            refs.Symbol.type = Image.Type.Simple;
+
+            dragHandler.Track = trackRT;
+
+            if (node.ShowValue)
+                BuildSliderValueField(node, rt, refs);
+
+            ApplyVisual(node, refs, node.Style, node.BuildState);
+            UpdateSliderVisual(node, refs);
+        }
+
+        private void BuildSliderValueField(ImlNode node, RectTransform rt, UiRefs refs)
+        {
+            var go = new GameObject("Value", typeof(RectTransform));
+            var fieldRT = (RectTransform)go.transform;
+            fieldRT.SetParent(rt, false);
+            fieldRT.anchorMin = new Vector2(0f, 1f);
+            fieldRT.anchorMax = new Vector2(0f, 1f);
+            fieldRT.pivot = new Vector2(0f, 1f);
+            float h = LayoutEngine.TextFieldHeight;
+            fieldRT.sizeDelta = new Vector2(LayoutEngine.SliderValueBoxWidth, h);
+            fieldRT.anchoredPosition = new Vector2(
+                node.Rect.width - LayoutEngine.SliderValueBoxWidth,
+                -(node.Rect.height - h) / 2f);
+
+            var img = go.AddComponent<Image>();
+            img.sprite = GetBakedSprite(8, ParseHex("#151719"), ParseHex("#222326"), 1);
+            img.type = Image.Type.Sliced;
+            img.raycastTarget = true;
+
+            var input = go.AddComponent<InputField>();
+            input.targetGraphic = img;
+
+            var txtGo = new GameObject("Text", typeof(RectTransform));
+            var txtRT = (RectTransform)txtGo.transform;
+            txtRT.SetParent(fieldRT, false);
+            StretchFull(txtRT);
+            txtRT.offsetMin = new Vector2(6f, 3f);
+            txtRT.offsetMax = new Vector2(-6f, -3f);
+            var txt = txtGo.AddComponent<Text>();
+            txt.font = DefaultFont;
+            txt.fontSize = 12;
+            txt.color = ParseHex("#E9ECEF");
+            txt.alignment = TextAnchor.MiddleLeft;
+            txt.raycastTarget = false;
+            input.textComponent = txt;
+
+            var captured = node;
+            input.text = FormatSliderValue(node.FloatValue, node.Max);
+            input.onEndEdit.AddListener(v =>
+            {
+                if (float.TryParse(v, out var parsed))
+                {
+                    parsed = Mathf.Clamp(parsed, captured.Min, captured.Max);
+                    if (!Mathf.Approximately(parsed, captured.FloatValue))
+                        OnSliderChanged(captured, parsed);
+                }
+            });
+        }
+
+        internal void OnSliderChanged(ImlNode node, float value)
+        {
+            if (Mathf.Approximately(node.FloatValue, value)) return;
+            node.FloatValue = value;
+            if (!string.IsNullOrEmpty(node.ValueBinding))
+                _rt.SetContextValue(node.ValueBinding, value);
+            if (node.Payload is UiRefs refs) UpdateSliderVisual(node, refs);
+            _rt.ScheduleEffect(() => _rt.InvokeElementEvent(node.Element, "on-changed", value));
+        }
+
+        private void UpdateSliderVisual(ImlNode node, UiRefs refs)
+        {
+            if (refs.Track == null) return;
+            float range = Mathf.Max(0.0001f, node.Max - node.Min);
+            float t = Mathf.Clamp01((node.FloatValue - node.Min) / range);
+            if (node.Step > 0f && node.Step < node.Max - node.Min)
+            {
+                // quantize display position too so the thumb snaps with the value
+                float snapped = node.Min + Mathf.Round((node.FloatValue - node.Min) / node.Step) * node.Step;
+                t = Mathf.Clamp01((Mathf.Clamp(snapped, node.Min, node.Max) - node.Min) / range);
+            }
+
+            if (refs.Fill != null)
+                ((RectTransform)refs.Fill.transform).sizeDelta = new Vector2(t * refs.TrackW, LayoutEngine.SliderTrackHeight);
+
+            if (refs.Symbol != null)
+            {
+                float d = LayoutEngine.SliderThumbSize;
+                float cx = Mathf.Clamp(t * refs.TrackW, d / 2f, refs.TrackW - d / 2f);
+                ((RectTransform)refs.Symbol.transform).anchoredPosition = new Vector2(cx, 0f);
+            }
+
+            if (node.ShowValue)
+            {
+                var valueGo = refs.Root.transform.Find("Value");
+                var input = valueGo != null ? valueGo.GetComponent<InputField>() : null;
+                if (input != null && input.textComponent != null)
+                    input.text = FormatSliderValue(node.FloatValue, node.Max);
+            }
+        }
+
+        private static string FormatSliderValue(float value, float max)
+        {
+            bool isInt = value == Mathf.Round(value) && max > 1f;
+            return value.ToString(isInt ? "F0" : "F2");
+        }
+
+        private void BuildInputField(ImlNode node, Transform parent, Rect parentRect, bool multiline)
+        {
+            var rt = CreateGO(node, parent, parentRect);
+            var refs = (UiRefs)node.Payload;
+
+            refs.Background = rt.gameObject.AddComponent<Image>();
+            refs.Background.raycastTarget = true;
+
+            var input = rt.gameObject.AddComponent<InputField>();
+            input.targetGraphic = refs.Background;
+            input.lineType = multiline
+                ? InputField.LineType.MultiLineNewline
+                : InputField.LineType.SingleLine;
+
+            refs.Label = new GameObject("Text", typeof(RectTransform)).AddComponent<Text>();
+            refs.Label.transform.SetParent(rt, false);
+            StretchFull((RectTransform)refs.Label.transform);
+            ((RectTransform)refs.Label.transform).offsetMin = new Vector2(6f, 3f);
+            ((RectTransform)refs.Label.transform).offsetMax = new Vector2(-6f, -3f);
+            refs.Label.raycastTarget = false;
+            refs.Label.text = node.Text ?? "";
+            refs.Label.font = DefaultFont;
+            refs.Label.alignment = TextAnchor.MiddleLeft;
+            refs.Label.horizontalOverflow = HorizontalWrapMode.Overflow;
+            refs.Label.verticalOverflow = VerticalWrapMode.Overflow;
+            input.textComponent = refs.Label;
+            input.text = node.Text ?? "";
+
+            var fx = rt.gameObject.AddComponent<ImlSelectFx>();
+            fx.Target = refs.Background;
+
+            var captured = node;
+            input.onValueChanged.AddListener(v =>
+            {
+                captured.Text = v;
+                if (!string.IsNullOrEmpty(captured.ValueBinding))
+                    _rt.SetContextValue(captured.ValueBinding, v);
+                if (!string.IsNullOrEmpty(captured.OnChange))
+                    _rt.ScheduleEffect(() => _rt.InvokeElementEvent(captured.Element, "on-changed", v));
+            });
+            input.onEndEdit.AddListener(v =>
+            {
+                captured.Text = v;
+                if (!string.IsNullOrEmpty(captured.ValueBinding))
+                    _rt.SetContextValue(captured.ValueBinding, v);
+                if (!string.IsNullOrEmpty(captured.OnSubmit))
+                    _rt.ScheduleEffect(() => _rt.InvokeElementEvent(captured.Element, "on-text-submit", v));
+            });
+
+            ApplyVisual(node, refs, node.Style, node.BuildState);
+            refs.NormalSprite = refs.Background.sprite;
+        }
+
+        private void BuildSeparator(ImlNode node, Transform parent, Rect parentRect)
+        {
+            var rt = CreateGO(node, parent, parentRect);
+            var refs = (UiRefs)node.Payload;
+            refs.Background = rt.gameObject.AddComponent<Image>();
+            refs.Background.raycastTarget = false;
+            refs.Background.sprite = _flatSprite;
+            ApplyVisual(node, refs, node.Style, node.BuildState);
+        }
+
+        private void BuildIcon(ImlNode node, Transform parent, Rect parentRect)
+        {
+            var rt = CreateGO(node, parent, parentRect);
+            var refs = (UiRefs)node.Payload;
+            int sz = Mathf.RoundToInt(node.Rect.width);
+            refs.Background = rt.gameObject.AddComponent<Image>();
+            refs.Background.raycastTarget = false;
+
+            refs.Symbol = new GameObject("Symbol", typeof(RectTransform)).AddComponent<Image>();
+            var symRT = (RectTransform)refs.Symbol.transform;
+            symRT.SetParent(rt, false);
+            StretchFull(symRT);
+            refs.Symbol.raycastTarget = false;
+
+            refs.Overlay = new GameObject("Overlay", typeof(RectTransform)).AddComponent<Image>();
+            var ovRT = (RectTransform)refs.Overlay.transform;
+            ovRT.SetParent(rt, false);
+            StretchFull(ovRT);
+            refs.Overlay.raycastTarget = false;
+            refs.Overlay.sprite = GetRoundedSprite(sz / 2);
+            refs.Overlay.type = Image.Type.Sliced;
+            refs.Overlay.color = Color.clear;
+
+            if (HasEvents(node.Element))
+            {
+                var captured = node;
+                var btn = rt.gameObject.AddComponent<Button>();
+                btn.transition = Selectable.Transition.None;
+                btn.targetGraphic = refs.Background;
+                btn.onClick.AddListener(() => _rt.HandleElementEvents(captured.Element));
+                _interactive[rt.gameObject] = node;
+            }
+
+            ApplyVisual(node, refs, node.Style, node.BuildState);
+        }
+
+        private void BuildArrowButton(ImlNode node, Transform parent, Rect parentRect)
+        {
+            var rt = CreateGO(node, parent, parentRect);
+            var refs = (UiRefs)node.Payload;
+            refs.Background = rt.gameObject.AddComponent<Image>();
+            refs.Background.raycastTarget = true;
+
+            var captured = node;
+            var btn = rt.gameObject.AddComponent<Button>();
+            btn.transition = Selectable.Transition.None;
+            btn.targetGraphic = refs.Background;
+            btn.onClick.AddListener(() => _rt.HandleElementEvents(captured.Element));
+            _interactive[rt.gameObject] = node;
+
+            ApplyVisual(node, refs, node.Style, node.BuildState);
+        }
+
+        private void BuildScrollView(ImlNode node, Transform parent, Rect parentRect)
+        {
+            var rt = CreateGO(node, parent, parentRect);
+            var refs = (UiRefs)node.Payload;
+
+            var img = rt.gameObject.AddComponent<Image>();
+            img.sprite = _flatSprite;
+            img.color = new Color(0f, 0f, 0f, 0f);   // transparent raycast surface for wheel input
+            img.raycastTarget = true;
+            refs.Background = img;
+            ApplyVisual(node, refs, node.Style, node.BuildState);
+            if (node.Style.Setters.ContainsKey("background")) img.raycastTarget = true;
+
+            rt.gameObject.AddComponent<RectMask2D>();
+
+            var scroll = rt.gameObject.AddComponent<ScrollRect>();
+            scroll.horizontal = false;
+            scroll.vertical = true;
+            scroll.movementType = ScrollRect.MovementType.Elastic;
+            scroll.inertia = true;
+            scroll.scrollSensitivity = 30f;
+            scroll.viewport = rt;
+
+            var contentGo = new GameObject("Content", typeof(RectTransform));
+            var content = (RectTransform)contentGo.transform;
+            content.SetParent(rt, false);
+            content.anchorMin = new Vector2(0f, 1f);
+            content.anchorMax = new Vector2(0f, 1f);
+            content.pivot = new Vector2(0f, 1f);
+            content.anchoredPosition = Vector2.zero;
+            // padding is baked into the children positions, so include it here
+            float padT = StyleValues.GetFloat(node.Style, "paddingTop", 0f);
+            float padB = StyleValues.GetFloat(node.Style, "paddingBottom", 0f);
+            float totalH = padT + node.ContentSize.y + padB;
+            content.sizeDelta = new Vector2(node.Rect.width, totalH);
+            scroll.content = content;
+
+            foreach (var c in node.BgChildren) BuildNode(c, content, node.Rect);
+            foreach (var c in node.Children) BuildNode(c, content, node.Rect);
+            foreach (var c in node.FgChildren) BuildNode(c, content, node.Rect);
+
+            float viewH = node.Rect.height;
+            float maxScroll = Mathf.Max(0f, totalH - viewH);
+            float saved = Mathf.Clamp(_rt.GetScrollPos(node.ScrollKey), 0f, maxScroll);
+            scroll.verticalNormalizedPosition = maxScroll > 0f ? 1f - saved / maxScroll : 1f;
+            scroll.onValueChanged.AddListener(v =>
+                _rt.SetScrollPos(node.ScrollKey, (1f - v.y) * maxScroll));
+        }
+
+        // ── visual application (build + state refresh share this) ───────────
+
+        private sealed class UiRefs
+        {
+            public GameObject Root;
+            public Image Background;   // box bg / button bg / pill / track / field bg
+            public Text Label;         // text / button label / input text
+            public Image Symbol;       // icon symbol / arrow / checkmark / slider handle
+            public Image Knob;         // switch knob
+            public Image Overlay;      // hover/press tint overlay
+            public RectTransform Track; // slider track
+            public Image Fill;          // slider fill
+            public float TrackW;
+            public Sprite NormalSprite; // text field normal bg
+        }
+
+        private void ApplyState(ImlNode node)
+        {
+            if (node?.Element == null || !(node.Payload is UiRefs refs)) return;
+            var state = node.BuildState;
+            if (node == _hovered) state |= ImlStateFlags.Hover;
+            if (node == _pressed) state |= ImlStateFlags.Press;
+            ImlStyle style;
+            if (state == node.BuildState)
+            {
+                style = node.Style;
+            }
+            else
+            {
+                style = _rt.Styles.Resolve(node.Element, node.Parent?.Style, state,
+                    _rt.ResolveAttributeValue);
+                if (node.Kind == ImlNodeKind.SelectorOption)
+                    style = _rt.ResolveSelectorOptionStyle(style, node.OptionSelected);
+            }
+            ApplyVisual(node, refs, style, state);
+        }
+
+        private void ApplyVisual(ImlNode node, UiRefs refs, ImlStyle style, ImlStateFlags state)
+        {
+            bool hover = (state & ImlStateFlags.Hover) != 0;
+            bool press = (state & ImlStateFlags.Press) != 0;
+            float opacity = StyleValues.GetFloat(style, "opacity", 1f);
+            if (opacity <= 0f && refs.Root != null && node.Kind != ImlNodeKind.ScrollView)
+            {
+                // treat opacity 0 as invisible but keep layout
+                if (refs.Background != null) refs.Background.color = Color.clear;
+                if (refs.Label != null) refs.Label.color = Color.clear;
+                return;
+            }
+
+            switch (node.Kind)
+            {
+                case ImlNodeKind.Box:
+                case ImlNodeKind.Root:
+                    if (refs.Background != null) ApplyBoxImage(refs.Background, style, opacity, 1f);
+                    break;
+
+                case ImlNodeKind.ScrollView:
+                    if (refs.Background != null)
+                    {
+                        if (node.Style.Setters.ContainsKey("background"))
+                            ApplyBoxImage(refs.Background, style, opacity, 1f);
+                    }
+                    break;
+
+                case ImlNodeKind.Text:
+                    ApplyLabelStyle(refs.Label, style, opacity);
+                    break;
+
+                case ImlNodeKind.Link:
+                {
+                    var color = StyleValues.GetColor(style, "color", ParseHex("#D973A5"));
+                    if (hover) color = Color.white;
+                    color.a *= opacity;
+                    if (refs.Label != null) refs.Label.color = color;
+                    if (refs.Symbol != null) refs.Symbol.color = color;
+                    break;
+                }
+
+                case ImlNodeKind.Button:
+                case ImlNodeKind.SelectorOption:
+                    if (refs.Background != null)
+                        ApplyBoxImage(refs.Background, style, opacity, hover ? 1.35f : press ? 0.7f : 1f);
+                    ApplyLabelStyle(refs.Label, style, opacity, center: true);
+                    break;
+
+                case ImlNodeKind.Switch:
+                {
+                    bool on = node.Checked;
+                    var fill = StyleValues.GetColor(style, on ? "switchOn" : "switchOff",
+                        on ? ParseHex("#D973A5") : ParseHex("#313338"));
+                    if (hover && !press) fill = Multiply(fill, 1.15f);
+                    fill.a *= opacity;
+                    if (refs.Background != null) refs.Background.color = fill;
+                    if (refs.Knob != null)
+                    {
+                        var knob = StyleValues.GetColor(style, "knobColor", Color.white);
+                        knob.a *= opacity;
+                        refs.Knob.color = knob;
+                        float d = LayoutEngine.SwitchKnobSize;
+                        float x = on ? LayoutEngine.SwitchW - 2f - d / 2f : 2f + d / 2f;
+                        ((RectTransform)refs.Knob.transform).anchoredPosition = new Vector2(x, 0f);
+                    }
+                    if (refs.Overlay != null)
+                        refs.Overlay.color = new Color(1f, 1f, 1f, (hover ? 0.07f : 0f) + (press ? 0.08f : 0f));
+                    break;
+                }
+
+                case ImlNodeKind.Checkbox:
+                {
+                    bool on = node.Checked;
+                    var bg = StyleValues.GetColor(style, on ? "checkBg" : "background",
+                        on ? ParseHex("#D973A5") : ParseHex("#313338"));
+                    if (hover && !press) bg = Multiply(bg, 1.15f);
+                    Color? border = null;
+                    if (!on)
+                    {
+                        var b = StyleValues.GetColor(style, "borderColor", ParseHex("#494F5C"));
+                        b.a *= opacity;
+                        border = b;
+                    }
+                    if (refs.Background != null)
+                    {
+                        int radius = StyleValues.GetInt(style, "radius", 4);
+                        if (border.HasValue)
+                            refs.Background.sprite = GetBakedSprite(radius, bg, border.Value, 1);
+                        else
+                        {
+                            refs.Background.sprite = GetRoundedSprite(radius);
+                            bg.a *= opacity;
+                            refs.Background.color = bg;
+                        }
+                        refs.Background.type = Image.Type.Sliced;
+                    }
+                    if (refs.Symbol != null)
+                    {
+                        var check = StyleValues.GetColor(style, "checkColor", Color.white);
+                        refs.Symbol.sprite = GetTextureSprite(GuiTextureFactory.GetCheckmark(
+                            Mathf.RoundToInt(LayoutEngine.CheckboxSize), check), 0);
+                        refs.Symbol.gameObject.SetActive(on);
+                    }
+                    if (refs.Overlay != null)
+                        refs.Overlay.color = new Color(1f, 1f, 1f, (hover ? 0.07f : 0f) + (press ? 0.08f : 0f));
+                    break;
+                }
+
+                case ImlNodeKind.Icon:
+                {
+                    var circle = StyleValues.GetColor(style, "background", ParseHex("#494F5C"));
+                    circle.a *= opacity;
+                    if (refs.Background != null)
+                    {
+                        var borderC = StyleValues.GetColor(style, "borderColor", ParseHex("#313338"));
+                        borderC.a *= opacity;
+                        refs.Background.sprite = GetTextureSprite(GuiTextureFactory.GetCircle(
+                            Mathf.RoundToInt(node.Rect.width), circle, borderC, 2), 0);
+                        refs.Background.type = Image.Type.Simple;
+                    }
+                    if (refs.Symbol != null)
+                    {
+                        var sym = StyleValues.GetColor(style, "color", Color.white);
+                        sym.a *= opacity;
+                        refs.Symbol.sprite = GetTextureSprite(GuiTextureFactory.GetIconSymbol(
+                            Mathf.RoundToInt(node.Rect.width), MapIcon(node.IconType), sym), 0);
+                        refs.Symbol.type = Image.Type.Simple;
+                    }
+                    if (refs.Overlay != null)
+                        refs.Overlay.color = new Color(1f, 1f, 1f, (hover ? 0.07f : 0f) + (press ? 0.08f : 0f));
+                    break;
+                }
+
+                case ImlNodeKind.ArrowButton:
+                {
+                    var dir = MapArrow(node.Direction);
+                    var bg = StyleValues.GetColor(style, "background", ParseHex("#313338"));
+                    if (hover && !press) bg = Multiply(bg, 1.35f);
+                    bg.a *= opacity;
+                    var borderC = StyleValues.GetColor(style, "borderColor", ParseHex("#494F5C"));
+                    borderC.a *= opacity;
+                    if (refs.Background != null)
+                    {
+                        int radius = StyleValues.GetInt(style, "radius", 4);
+                        Texture2D composed = null;
+                        if (GuiTextureFactory.TryGetExternalArrowButton(
+                                Mathf.RoundToInt(node.Rect.width), dir, bg, borderC, 1, radius,
+                                StyleValues.GetColor(style, "color", Color.white), out composed))
+                        {
+                            refs.Background.sprite = GetTextureSprite(composed, radius);
+                        }
+                        else
+                        {
+                            refs.Background.sprite = GetBakedSprite(radius, bg, borderC, 1);
+                        }
+                        refs.Background.color = Color.white;
+                        refs.Background.type = Image.Type.Sliced;
+                    }
+                    bool external = GuiTextureFactory.ExternalArrowButtonRenderer != null;
+                    if (refs.Symbol == null && !external)
+                    {
+                        // builtin path: draw the arrow ourselves
+                        refs.Symbol = new GameObject("Arrow", typeof(RectTransform)).AddComponent<Image>();
+                        var arrRT = (RectTransform)refs.Symbol.transform;
+                        arrRT.SetParent(refs.Root.transform, false);
+                        StretchFull(arrRT);
+                        arrRT.SetAsLastSibling();
+                        arrRT.offsetMin = new Vector2(2f, 2f);
+                        arrRT.offsetMax = new Vector2(-2f, -2f);
+                        refs.Symbol.raycastTarget = false;
+                    }
+                    if (refs.Symbol != null && !external)
+                    {
+                        var arrow = StyleValues.GetColor(style, "color", Color.white);
+                        arrow.a *= opacity;
+                        refs.Symbol.sprite = GetTextureSprite(GuiTextureFactory.GetArrow(
+                            Mathf.RoundToInt(node.Rect.width), dir, arrow), 0);
+                        refs.Symbol.type = Image.Type.Simple;
+                    }
+                    if (refs.Overlay != null)
+                        refs.Overlay.color = new Color(1f, 1f, 1f, (hover ? 0.07f : 0f) + (press ? 0.08f : 0f));
+                    break;
+                }
+
+                case ImlNodeKind.Slider:
+                {
+                    var trackC = StyleValues.GetColor(style, "sliderTrack", ParseHex("#313338"));
+                    trackC.a *= opacity;
+                    var fillC = StyleValues.GetColor(style, "sliderFill", ParseHex("#D973A5"));
+                    fillC.a *= opacity;
+                    var thumbC = StyleValues.GetColor(style, "sliderThumb", Color.white);
+                    if (refs.Background != null)
+                    {
+                        refs.Background.sprite = GetRoundedSprite(Mathf.RoundToInt(LayoutEngine.SliderTrackHeight / 2f));
+                        refs.Background.color = trackC;
+                        refs.Background.type = Image.Type.Sliced;
+                    }
+                    if (refs.Fill != null)
+                    {
+                        refs.Fill.sprite = GetRoundedSprite(Mathf.RoundToInt(LayoutEngine.SliderTrackHeight / 2f));
+                        refs.Fill.color = fillC;
+                        refs.Fill.type = Image.Type.Sliced;
+                    }
+                    if (refs.Symbol != null)
+                    {
+                        refs.Symbol.sprite = GetRoundedSprite(Mathf.RoundToInt(LayoutEngine.SliderThumbSize / 2f));
+                        refs.Symbol.color = thumbC;
+                        refs.Symbol.type = Image.Type.Simple;
+                    }
+                    break;
+                }
+
+                case ImlNodeKind.TextField:
+                case ImlNodeKind.TextArea:
+                {
+                    var bg = StyleValues.GetColor(style, "background", ParseHex("#151719"));
+                    bg.a *= opacity;
+                    var borderC = StyleValues.GetColor(style, "borderColor", ParseHex("#222326"));
+                    borderC.a *= opacity;
+                    int radius = StyleValues.GetInt(style, "radius", 8);
+                    int bw = StyleValues.GetInt(style, "borderWidth", 1);
+                    if (refs.Background != null)
+                    {
+                        refs.Background.sprite = GetBakedSprite(radius, bg, borderC, bw);
+                        refs.Background.type = Image.Type.Sliced;
+                        refs.Background.color = Color.white;
+                    }
+                    refs.NormalSprite = refs.Background != null ? refs.Background.sprite : null;
+                    var focus = StyleValues.GetColor(style, "focusBorder", ParseHex("#D973A5"));
+                    focus.a *= opacity;
+                    var fx = refs.Root != null ? refs.Root.GetComponent<ImlSelectFx>() : null;
+                    if (fx != null)
+                    {
+                        fx.Normal = refs.Background != null ? refs.Background.sprite : null;
+                        fx.Focused = GetBakedSprite(radius, bg, focus, bw);
+                    }
+                    ApplyLabelStyle(refs.Label, style, opacity);
+                    break;
+                }
+
+                case ImlNodeKind.Separator:
+                {
+                    var c = StyleValues.GetColor(style, "background", ParseHex("#20FFFFFF"));
+                    c.a *= opacity;
+                    if (refs.Background != null) refs.Background.color = c;
+                    break;
+                }
+            }
+        }
+
+        private static void ApplyLabelStyle(Text label, ImlStyle style, float opacity, bool center = false)
+        {
+            if (label == null) return;
+            label.fontSize = Mathf.RoundToInt(StyleValues.GetFloat(style, "fontSize", 13f));
+            var color = StyleValues.GetColor(style, "color", ParseHex("#E9ECEF"));
+            color.a *= opacity;
+            label.color = color;
+            label.fontStyle = IsBold(style) ? FontStyle.Bold : FontStyle.Normal;
+            bool nowrap = string.Equals(StyleValues.GetStr(style, "whiteSpace", ""), "nowrap", StringComparison.OrdinalIgnoreCase);
+            label.horizontalOverflow = nowrap ? HorizontalWrapMode.Overflow : HorizontalWrapMode.Wrap;
+            label.verticalOverflow = VerticalWrapMode.Overflow;
+            label.raycastTarget = false;
+            if (center) { label.alignment = TextAnchor.MiddleCenter; return; }
+            switch (StyleValues.GetStr(style, "textAlign", "left").ToLowerInvariant())
+            {
+                case "center": label.alignment = TextAnchor.MiddleCenter; break;
+                case "right": label.alignment = TextAnchor.MiddleRight; break;
+                default: label.alignment = TextAnchor.MiddleLeft; break;
+            }
+        }
+
+        private void ApplyBoxImage(Image img, ImlStyle style, float opacity, float brightness)
+        {
+            var bg = StyleValues.GetColor(style, "background", Color.white);
+            if (brightness != 1f) bg = Multiply(bg, brightness);
+            bg.a *= opacity;
+            int radius = StyleValues.GetInt(style, "radius", 0);
+            float bw = StyleValues.GetFloat(style, "borderWidth", 0f);
+            if (bw > 0f && StyleValues.TryParseColor(StyleValues.GetStr(style, "borderColor", ""), out var borderC))
+            {
+                borderC.a *= opacity;
+                img.sprite = GetBakedSprite(radius, bg, borderC, Mathf.RoundToInt(bw));
+                img.color = Color.white;
+            }
+            else if (radius > 0)
+            {
+                img.sprite = GetRoundedSprite(radius);
+                img.color = bg;
+            }
+            else
+            {
+                img.sprite = _flatSprite;
+                img.color = bg;
+            }
+            img.type = radius > 0 || bw > 0f ? Image.Type.Sliced : Image.Type.Simple;
+        }
+
+        private static bool IsBold(ImlStyle style)
+        {
+            var fw = StyleValues.GetStr(style, "fontWeight", "").ToLowerInvariant();
+            if (fw.Contains("bold") || fw == "700" || fw == "800" || fw == "900") return true;
+            var fs = StyleValues.GetStr(style, "fontStyle", "").ToLowerInvariant();
+            return fs.Contains("bold");
+        }
+
+        private static Color Multiply(Color c, float f) => new Color(c.r * f, c.g * f, c.b * f, c.a);
+
+        private static Color ParseHex(string hex)
+            => StyleValues.TryParseColor(hex, out var c) ? c : Color.white;
+
+        private static GuiTextureFactory.IconSymbol MapIcon(string kind) => kind switch
+        {
+            "success" => GuiTextureFactory.IconSymbol.Success,
+            "warning" => GuiTextureFactory.IconSymbol.Warning,
+            "error" => GuiTextureFactory.IconSymbol.Error,
+            "stop" => GuiTextureFactory.IconSymbol.Stop,
+            _ => GuiTextureFactory.IconSymbol.Information,
+        };
+
+        private static GuiTextureFactory.ArrowDir MapArrow(string dir) => dir switch
+        {
+            "down" => GuiTextureFactory.ArrowDir.Down,
+            "left" => GuiTextureFactory.ArrowDir.Left,
+            "up" => GuiTextureFactory.ArrowDir.Up,
+            _ => GuiTextureFactory.ArrowDir.Right,
+        };
+
+        private static bool HasEvents(ImlElement el)
+        {
+            if (el == null) return false;
+            foreach (var kv in el.Attributes)
+                if (kv.Key.StartsWith("on-") && !kv.Key.StartsWith("data-on-"))
+                    return true;
+            return false;
+        }
+
+        private static void StretchFull(RectTransform rt)
+        {
+            rt.anchorMin = Vector2.zero;
+            rt.anchorMax = Vector2.one;
+            rt.offsetMin = Vector2.zero;
+            rt.offsetMax = Vector2.zero;
+        }
+
+        // ── pointer state (hover/press pseudo classes) ──────────────────────
+
+        private void UpdatePointerState()
+        {
+            ImlNode hovered = null;
+            var es = EventSystem.current;
+            if (es != null && _interactive.Count > 0)
+            {
+                _rayResults.Clear();
+                es.RaycastAll(new PointerEventData(es) { position = Input.mousePosition }, _rayResults);
+                foreach (var res in _rayResults)
+                {
+                    if (res.gameObject != null && _interactive.TryGetValue(res.gameObject, out var n))
+                    {
+                        hovered = n;
+                        break;
+                    }
+                }
+            }
+
+            var prevH = _hovered;
+            var prevP = _pressed;
+            _hovered = hovered;
+            _pressed = hovered != null && Input.GetMouseButton(0) ? hovered : null;
+            if (prevH == _hovered && prevP == _pressed) return;
+
+            if (prevH != null && prevH != _hovered && prevH != _pressed) ApplyState(prevH);
+            if (prevP != null && prevP != _pressed && prevP != _hovered) ApplyState(prevP);
+            if (_hovered != null && _hovered != prevH) ApplyState(_hovered);
+            if (_pressed != null && _pressed != prevP && _pressed != _hovered) ApplyState(_pressed);
+        }
+
+        // ── fonts & text measurement ────────────────────────────────────────
 
         private Font DefaultFont
         {
@@ -60,10 +1232,9 @@ namespace Iris.Iml
 
         /// <summary>
         /// Built-in fonts (Arial) have no CJK glyphs, so Chinese/Japanese/Korean
-        /// text renders blank in Text/TextField. Prefer a system CJK font when
-        /// one is available; fall back to the built-in font otherwise.
+        /// text renders blank. Prefer a system CJK font when one is available.
         /// </summary>
-        private Font TryLoadCjkFont()
+        private static Font TryLoadCjkFont()
         {
             string[] candidates = {
                 "Noto Sans CJK SC", "Noto Sans CJK TC", "Noto Sans CJK JP", "Noto Sans CJK KR",
@@ -82,14 +1253,54 @@ namespace Iris.Iml
             return null;
         }
 
-        // ---- Sprite cache ----
-        // UGUI Image requires a non-null sprite to render. AddComponent<Image>() defaults
-        // sprite to null, which is why the dialog/button/icon backgrounds all came out
-        // invisible. We cache a flat 1x1 white sprite (for solid color panels) and a
-        // procedurally generated rounded-corner sprite per radius (for 9-slice corners).
-        private static Sprite _flatSprite;
-        private static readonly Dictionary<int, Sprite> _roundedSpriteCache = new();
-        private static readonly Dictionary<string, Sprite> _iconSpriteCache = new();
+        /// <summary>
+        /// Deterministic text measurement via per-character font advances
+        /// (independent of TextGenerator state). Line height uses a 1.35×
+        /// factor, slightly generous so wrapping never under-allocates height.
+        /// </summary>
+        private Vector2 MeasureUGUIText(string text, int fontSize, float wrapWidth)
+        {
+            if (string.IsNullOrEmpty(text)) return new Vector2(0f, fontSize * 1.3f);
+            var font = DefaultFont;
+            if (font == null)
+                return new Vector2(text.Length * fontSize * 0.55f, fontSize * 1.35f);
+
+            try { font.RequestCharactersInTexture(text, fontSize, FontStyle.Normal); }
+            catch { /* non-dynamic font: fall through to per-char lookup */ }
+
+            const float lineHFactor = 1.35f;
+            float lineH = fontSize * lineHFactor;
+            float maxLineW = 0f, lineW = 0f;
+            int lines = 1;
+            foreach (var ch in text)
+            {
+                if (ch == '\r') continue;
+                if (ch == '\n')
+                {
+                    maxLineW = Mathf.Max(maxLineW, lineW);
+                    lineW = 0f;
+                    lines++;
+                    continue;
+                }
+                float adv;
+                if (font.GetCharacterInfo(ch, out var ci, fontSize, FontStyle.Normal))
+                    adv = ci.advance;
+                else
+                    adv = ch >= 0x2E80 ? fontSize : fontSize * 0.55f;  // CJK vs latin estimate
+                if (wrapWidth > 0f && lineW > 0f && lineW + adv > wrapWidth)
+                {
+                    maxLineW = Mathf.Max(maxLineW, lineW);
+                    lineW = 0f;
+                    lines++;
+                }
+                lineW += adv;
+            }
+            maxLineW = Mathf.Max(maxLineW, lineW);
+            float width = wrapWidth > 0f && lines > 1 ? Mathf.Min(maxLineW, wrapWidth) : maxLineW;
+            return new Vector2(width, lines * lineH);
+        }
+
+        // ── sprite cache ────────────────────────────────────────────────────
 
         private static Sprite FlatSprite
         {
@@ -97,21 +1308,19 @@ namespace Iris.Iml
             {
                 if (_flatSprite != null) return _flatSprite;
                 var tex = Texture2D.whiteTexture;
-                _flatSprite = Sprite.Create(
-                    tex,
-                    new Rect(0, 0, tex.width, tex.height),
-                    new Vector2(0.5f, 0.5f),
-                    100f, 0, SpriteMeshType.FullRect);
+                _flatSprite = Sprite.Create(tex, new Rect(0, 0, tex.width, tex.height),
+                    new Vector2(0.5f, 0.5f), 100f, 0, SpriteMeshType.FullRect);
                 _flatSprite.name = "IrisFlat";
                 _flatSprite.hideFlags = HideFlags.HideAndDontSave;
                 return _flatSprite;
             }
         }
 
+        /// <summary>White rounded-corner 9-slice sprite (tint via Image.color).</summary>
         private static Sprite GetRoundedSprite(int radius)
         {
             if (radius <= 0) return FlatSprite;
-            if (_roundedSpriteCache.TryGetValue(radius, out var cached)) return cached;
+            if (_roundedSpriteCache.TryGetValue(radius, out var cached) && cached != null) return cached;
 
             const int size = 64;
             var tex = new Texture2D(size, size, TextureFormat.RGBA32, false)
@@ -120,12 +1329,10 @@ namespace Iris.Iml
                 hideFlags = HideFlags.HideAndDontSave,
                 filterMode = FilterMode.Bilinear,
             };
-
             var pixels = new Color32[size * size];
             float r = radius;
             float r2 = r * r;
             float innerR2 = (r - 1.5f) * (r - 1.5f);
-
             for (int y = 0; y < size; y++)
             {
                 for (int x = 0; x < size; x++)
@@ -135,1810 +1342,124 @@ namespace Iris.Iml
                     else if (x >= size - radius) dx = x - (size - radius - 1);
                     if (y < radius) dy = radius - y;
                     else if (y >= size - radius) dy = y - (size - radius - 1);
-
-                    float distSq = (float)(dx * dx + dy * dy);
+                    float distSq = dx * dx + dy * dy;
                     byte alpha;
-                    if (distSq <= innerR2)
-                    {
-                        alpha = 255;
-                    }
+                    if (distSq <= innerR2) alpha = 255;
                     else if (distSq < r2)
                     {
                         float dist = Mathf.Sqrt(distSq);
                         alpha = (byte)Mathf.Clamp((r - dist + 0.5f) * 255f, 0f, 255f);
                     }
-                    else
-                    {
-                        alpha = 0;
-                    }
-
+                    else alpha = 0;
                     pixels[y * size + x] = new Color32(255, 255, 255, alpha);
                 }
             }
-
             tex.SetPixels32(pixels);
             tex.Apply(false, true);
 
-            // 9-slice with border = radius so corners keep their shape at any size.
             var border = new Vector4(radius, radius, radius, radius);
-            var sprite = Sprite.Create(
-                tex,
-                new Rect(0, 0, size, size),
-                new Vector2(0.5f, 0.5f),
-                100f, 0, SpriteMeshType.FullRect,
-                border);
+            var sprite = Sprite.Create(tex, new Rect(0, 0, size, size),
+                new Vector2(0.5f, 0.5f), 100f, 0, SpriteMeshType.FullRect, border);
             sprite.name = $"IrisRounded_{radius}";
             sprite.hideFlags = HideFlags.HideAndDontSave;
             _roundedSpriteCache[radius] = sprite;
             return sprite;
         }
 
-        // ---- Icon rendering ----
-        // Icons are rasterized with the exact same System.Drawing pipeline that
-        // IridiumLayout uses (see v2/UI/IridiumLayout.cs RenderCircleGlyph + Draw*):
-        // an anti-aliased colored disc with a darker border ring and a white vector
-        // symbol, rows flipped to match Unity's texture orientation. This keeps the
-        // icons pixel-identical and correctly oriented instead of the old flat disc
-        // with an Arial font glyph on top.
-        private static Sprite GetIconSprite(string style)
+        /// <summary>Sprite with baked fill + border colors (for bordered controls).</summary>
+        private static Sprite GetBakedSprite(int radius, Color fill, Color border, int borderWidth)
         {
-            if (_iconSpriteCache.TryGetValue(style, out var cached)) return cached;
+            string key = $"{radius}|{fill.r:F3},{fill.g:F3},{fill.b:F3},{fill.a:F3}" +
+                         $"|{border.r:F3},{border.g:F3},{border.b:F3},{border.a:F3}|{borderWidth}";
+            if (_bakedSpriteCache.TryGetValue(key, out var cached) && cached != null) return cached;
 
-            // Palette from IridiumLayout's Resolution icon set.
-            (Color fill, Color border) = style switch
-            {
-                "information" => (new Color(0x49 / 255f, 0x4F / 255f, 0x5C / 255f), new Color(0x37 / 255f, 0x39 / 255f, 0x3F / 255f)),
-                "success"     => (new Color(0x03 / 255f, 0x98 / 255f, 0x55 / 255f), new Color(0x02 / 255f, 0x79 / 255f, 0x48 / 255f)),
-                "warning"     => (new Color(0xF7 / 255f, 0x90 / 255f, 0x09 / 255f), new Color(0xDC / 255f, 0x68 / 255f, 0x03 / 255f)),
-                "error"       => (new Color(0xD9 / 255f, 0x20 / 255f, 0x20 / 255f), new Color(0xB4 / 255f, 0x18 / 255f, 0x18 / 255f)),
-                "stop"        => (new Color(0xD9 / 255f, 0x20 / 255f, 0x20 / 255f), new Color(0xB4 / 255f, 0x18 / 255f, 0x18 / 255f)),
-                _             => (new Color(0x49 / 255f, 0x4F / 255f, 0x5C / 255f), new Color(0x37 / 255f, 0x39 / 255f, 0x3F / 255f)),
-            };
-            var stroke = new Color(0xF8 / 255f, 0xF9 / 255f, 0xFA / 255f); // IridiumLayout TitleTextColors
-
-            // Render at 2x the layout size (24px) for crisp downscaling by the UI.
-            const int size = 48;
-            var texture = RenderIconTexture(size, size, graphics =>
-                RenderCircleGlyph(graphics, size, fill, border, stroke, style));
-            texture.name = $"IrisIcon_{style}";
-            texture.hideFlags = HideFlags.HideAndDontSave;
-            texture.filterMode = FilterMode.Bilinear;
-            texture.wrapMode = TextureWrapMode.Clamp;
-
-            var sprite = Sprite.Create(
-                texture,
-                new Rect(0, 0, size, size),
-                new Vector2(0.5f, 0.5f),
-                100f, 0, SpriteMeshType.FullRect);
-            sprite.name = $"IrisIcon_{style}";
+            radius = Mathf.Max(radius, 0);
+            int size = Mathf.Max(radius * 2 + 8, 16);
+            var tex = GuiTextureFactory.GetRoundedRect(size, size, radius, fill, border, Mathf.Max(0, borderWidth));
+            var border4 = new Vector4(radius, radius, radius, radius);
+            var sprite = Sprite.Create(tex, new Rect(0, 0, size, size),
+                new Vector2(0.5f, 0.5f), 100f, 0, SpriteMeshType.FullRect, border4);
+            sprite.name = "IrisBaked";
             sprite.hideFlags = HideFlags.HideAndDontSave;
-            _iconSpriteCache[style] = sprite;
+            _bakedSpriteCache[key] = sprite;
             return sprite;
         }
 
-        private static void RenderCircleGlyph(
-            SD.Graphics graphics,
-            int size,
-            Color color,
-            Color borderColor,
-            Color strokeColor,
-            string style
-        )
+        private static Sprite GetTextureSprite(Texture2D tex, int radius)
         {
-            var border = size * 2 / 20F;
-            {
-                using var path = new GraphicsPath();
-                path.AddArc(0, 0, size, size, 0, 360);
-                path.CloseFigure();
-                using var brush = new SD.SolidBrush(DrawingColor(borderColor));
-                graphics.FillPath(brush, path);
-            }
-            {
-                using var path = new GraphicsPath();
-                path.AddArc(border, border, size - border - border, size - border - border, 0, 360);
-                path.CloseFigure();
-                using var brush = new SD.SolidBrush(DrawingColor(color));
-                graphics.FillPath(brush, path);
-            }
-
-            switch (style)
-            {
-                case "information": DrawInformation(graphics, size, strokeColor); break;
-                case "success": DrawSuccess(graphics, size, strokeColor); break;
-                case "warning": DrawWarning(graphics, size, strokeColor); break;
-                case "error": DrawError(graphics, size, strokeColor); break;
-                case "stop": DrawStop(graphics, size, strokeColor); break;
-            }
-        }
-
-        private static Texture2D RenderIconTexture(int width, int height, Action<SD.Graphics> renderer)
-        {
-            Color[] pixels;
-            var stride = width * 4;
-
-            byte[] rawBytes;
-            {
-                using var bitmap = new SD.Bitmap(width, height, PixelFormat.Format32bppArgb);
-                using var graphics = SD.Graphics.FromImage(bitmap);
-                graphics.SmoothingMode = SmoothingMode.AntiAlias;
-                graphics.InterpolationMode = InterpolationMode.HighQualityBicubic;
-                graphics.PixelOffsetMode = PixelOffsetMode.HighQuality;
-                graphics.Clear(SD.Color.Transparent);
-                renderer(graphics);
-                var rect = new SD.Rectangle(0, 0, width, height);
-                var bitmapData = bitmap.LockBits(rect, ImageLockMode.ReadOnly, bitmap.PixelFormat);
-                rawBytes = new byte[Math.Abs(bitmapData.Stride) * bitmap.Height];
-                Marshal.Copy(bitmapData.Scan0, rawBytes, 0, rawBytes.Length);
-                bitmap.UnlockBits(bitmapData);
-                stride = Math.Abs(bitmapData.Stride);
-            }
-
-            pixels = new Color[width * height];
-            for (var row = 0; row < height; row++)
-            {
-                // Flip rows so the texture's top row maps to Unity's top (y = height).
-                var sourceRow = (height - 1 - row) * stride;
-                for (var col = 0; col < width; col++)
-                {
-                    var source = sourceRow + col * 4;
-                    pixels[row * width + col] = new Color(
-                        rawBytes[source + 2] / 255F,
-                        rawBytes[source + 1] / 255F,
-                        rawBytes[source] / 255F,
-                        rawBytes[source + 3] / 255F
-                    );
-                }
-            }
-
-            var texture = new Texture2D(width, height, TextureFormat.ARGB32, false);
-            texture.SetPixels(pixels);
-            texture.Apply(false, true);
-            return texture;
-        }
-
-        private static SD.Color DrawingColor(Color color)
-        {
-            return SD.Color.FromArgb(
-                (int)(color.a * 255),
-                (int)(color.r * 255),
-                (int)(color.g * 255),
-                (int)(color.b * 255)
-            );
-        }
-
-        private static SD.Pen StrokePen(int size, Color strokeColor, float thickness)
-        {
-            var pen = new SD.Pen(DrawingColor(strokeColor), size * thickness / 20F);
-            pen.StartCap = LineCap.Round;
-            pen.EndCap = LineCap.Round;
-            pen.LineJoin = LineJoin.Round;
-            return pen;
-        }
-
-        private static void FillDot(SD.Graphics graphics, float x, float y, float diameter, Color strokeColor)
-        {
-            using var path = new GraphicsPath();
-            path.AddArc(x, y, diameter, diameter, 0, 360);
-            path.CloseFigure();
-            using var brush = new SD.SolidBrush(DrawingColor(strokeColor));
-            graphics.FillPath(brush, path);
-        }
-
-        private static void DrawRingWithStem(SD.Graphics graphics, int size, Color strokeColor, float stemTop, float stemBottom)
-        {
-            using var path = new GraphicsPath();
-            path.AddArc(size * 4 / 20F, size * 4 / 20F, size * 12 / 20F, size * 12 / 20F, 0, 360);
-            path.StartFigure();
-            path.AddLine(size * 10 / 20F, size * stemTop / 20F, size * 10 / 20F, size * stemBottom / 20F);
-            using var pen = StrokePen(size, strokeColor, 1.5F);
-            graphics.DrawPath(pen, path);
-        }
-
-        private static void DrawInformation(SD.Graphics graphics, int size, Color strokeColor)
-        {
-            DrawRingWithStem(graphics, size, strokeColor, 9.5F, 13F);
-            FillDot(graphics, size * 9.25F / 20F, size * 6.25F / 20F, size * 1.5F / 20F, strokeColor);
-        }
-
-        private static void DrawSuccess(SD.Graphics graphics, int size, Color strokeColor)
-        {
-            using var path = new GraphicsPath();
-            path.AddArc(size * 4 / 20F, size * 4 / 20F, size * 12 / 20F, size * 12 / 20F, 0, 285);
-            path.StartFigure();
-            path.AddLines([
-                new SD.PointF(size * 8 / 20F, size * 9F / 20F),
-                new SD.PointF(size * 10 / 20F, size * 11F / 20F),
-                new SD.PointF(size * 16 / 20F, size * 5F / 20F)
-            ]);
-            using var pen = StrokePen(size, strokeColor, 1.5F);
-            graphics.DrawPath(pen, path);
-        }
-
-        private static void DrawWarning(SD.Graphics graphics, int size, Color strokeColor)
-        {
-            using var path = new GraphicsPath();
-            AppendRoundedPolyline(
-                path,
-                size * 2 / 20F,
-                true,
-                PolarPoint(size, 30, 9),
-                PolarPoint(size, 150, 9),
-                PolarPoint(size, 270, 9)
-            );
-            path.CloseFigure();
-            path.AddLine(size * 10 / 20F, size * 7 / 20F, size * 10 / 20F, size * 10.5F / 20F);
-            using var pen = StrokePen(size, strokeColor, 1.5F);
-            graphics.DrawPath(pen, path);
-
-            FillDot(graphics, size * 9.25F / 20F, size * 12.25F / 20F, size * 1.5F / 20F, strokeColor);
-        }
-
-        private static void DrawError(SD.Graphics graphics, int size, Color strokeColor)
-        {
-            DrawRingWithStem(graphics, size, strokeColor, 7F, 10.5F);
-            FillDot(graphics, size * 9.25F / 20F, size * 12.25F / 20F, size * 1.5F / 20F, strokeColor);
-        }
-
-        private static SD.PointF PolarPoint(int size, double angleDegrees, double distance)
-        {
-            return new SD.PointF(
-                (float)(size * (10 + distance * Math.Cos(angleDegrees / 180 * Math.PI)) / 20),
-                (float)(size * (11 + distance * Math.Sin(angleDegrees / 180 * Math.PI)) / 20)
-            );
-        }
-
-        private static void DrawStop(SD.Graphics graphics, int size, Color strokeColor)
-        {
-            using var path = new GraphicsPath();
-            var inset = size * 4.5F / 20F;
-            var block = size * 11F / 20F;
-            path.AddRectangle(new SD.RectangleF(inset, inset, block, block));
-            using var brush = new SD.SolidBrush(DrawingColor(strokeColor));
-            graphics.FillPath(brush, path);
-        }
-
-        private static void AppendRoundedPolyline(
-            GraphicsPath path,
-            double radius,
-            bool close,
-            params SD.PointF[] points
-        )
-        {
-            var count = points.Length;
-
-            if (count <= 1) return;
-
-            if (count == 2)
-            {
-                path.AddLine(points[0], points[1]);
-                return;
-            }
-
-            radius = Math.Max(radius, 0);
-
-            List<double> segmentLengths = [];
-
-            for (var i = 0; i < count; i++)
-            {
-                var from = points[i];
-                var to = points[i + 1 == count ? 0 : i + 1];
-                var dx = to.X - from.X;
-                var dy = to.Y - from.Y;
-                segmentLengths.Add(Math.Sqrt(dx * dx + dy * dy));
-            }
-
-            List<double> cornerRadii = [];
-
-            for (var i = 1; i < count - 1; i++)
-                cornerRadii.Add(Math.Min(radius, Math.Min(segmentLengths[i - 1] / 2, segmentLengths[i] / 2)));
-
-            if (close)
-            {
-                cornerRadii.Add(Math.Min(radius, Math.Min(segmentLengths[count - 2] / 2, segmentLengths[count - 1] / 2)));
-                cornerRadii.Add(Math.Min(radius, Math.Min(segmentLengths[count - 1] / 2, segmentLengths[0] / 2)));
-            }
-            else
-            {
-                cornerRadii[0] = Math.Min(radius, Math.Min(segmentLengths[0], segmentLengths[1] / 2));
-                cornerRadii[cornerRadii.Count - 1] = Math.Min(
-                    radius,
-                    Math.Min(segmentLengths[count - 3] / 2, segmentLengths[count - 2])
-                );
-                var leadLength = segmentLengths[0] - CornerProjection(
-                    cornerRadii[0],
-                    points[0].X,
-                    points[0].Y,
-                    points[1].X,
-                    points[1].Y,
-                    points[2].X,
-                    points[2].Y
-                );
-                var leadX = (points[1].X - points[0].X) * leadLength / segmentLengths[0];
-                var leadY = (points[1].Y - points[0].Y) * leadLength / segmentLengths[0];
-                path.AddLine(points[0], points[0] + new SD.SizeF((float)leadX, (float)leadY));
-            }
-
-            for (var i = 0; i < cornerRadii.Count; i++)
-            {
-                var cornerRadius = cornerRadii[i];
-                var p1 = points[i];
-                var p2 = points[i + 1 >= count ? i + 1 - count : i + 1];
-                var p3 = points[i + 2 >= count ? i + 2 - count : i + 2];
-                AppendCornerArc(path, cornerRadius, p1.X, p1.Y, p2.X, p2.Y, p3.X, p3.Y);
-            }
-
-            if (close) path.CloseFigure();
-            else path.AddLine(path.GetLastPoint(), points[count - 1]);
-        }
-
-        private static void AppendCornerArc(
-            GraphicsPath path,
-            double radius,
-            double xA,
-            double yA,
-            double xC,
-            double yC,
-            double xB,
-            double yB
-        )
-        {
-            var dx1 = xA - xC;
-            var dy1 = yA - yC;
-            var dx2 = xB - xC;
-            var dy2 = yB - yC;
-            var len1 = Math.Sqrt(dx1 * dx1 + dy1 * dy1);
-            var len2 = Math.Sqrt(dx2 * dx2 + dy2 * dy2);
-            dx1 /= len1;
-            dy1 /= len1;
-            dx2 /= len2;
-            dy2 /= len2;
-            var dot = dx1 * dx2 + dy1 * dy2;
-            var startAngle = (Math.Atan2(dy1, dx1) * 180 / Math.PI % 360 + 360) % 360;
-            var endAngle = (Math.Atan2(dy2, dx2) * 180 / Math.PI % 360 + 360) % 360;
-            if (startAngle > endAngle) (startAngle, endAngle) = (endAngle, startAngle);
-            if (endAngle - startAngle > 180) (startAngle, endAngle) = (endAngle, startAngle + 360);
-
-            var scale = radius / Math.Sqrt(1 - dot * dot);
-            var centerX = xC + (dx1 + dx2) * scale;
-            var centerY = yC + (dy1 + dy2) * scale;
-
-            path.AddArc(
-                (float)(centerX - radius),
-                (float)(centerY - radius),
-                (float)(radius + radius),
-                (float)(radius + radius),
-                (float)(endAngle + 90),
-                (float)(startAngle - endAngle + 180)
-            );
-        }
-
-        private static double CornerProjection(
-            double radius,
-            double xA,
-            double yA,
-            double xC,
-            double yC,
-            double xB,
-            double yB
-        )
-        {
-            var dx1 = xA - xC;
-            var dy1 = yA - yC;
-            var dx2 = xB - xC;
-            var dy2 = yB - yC;
-            var len1 = Math.Sqrt(dx1 * dx1 + dy1 * dy1);
-            var len2 = Math.Sqrt(dx2 * dx2 + dy2 * dy2);
-            dx1 /= len1;
-            dy1 /= len1;
-            dx2 /= len2;
-            dy2 /= len2;
-            var dot = dx1 * dx2 + dy1 * dy2;
-            var sx = dx1 + dx2;
-            var sy = dy1 + dy2;
-            return radius * Math.Sqrt((sx * sx + sy * sy) / (2 - dot - dot));
-        }
-
-        /// <summary>Apply background color + sprite to a freshly created Image, reading radius from the style.</summary>
-        private static void ApplyBackgroundStyle(Image img, ImlStyle style)
-        {
-            if (style?.Setters == null) { img.sprite = FlatSprite; return; }
-
-            if (style.Setters.TryGetValue("background", out var bg) &&
-                !string.IsNullOrEmpty(bg) &&
-                bg.StartsWith("#") &&
-                ColorUtility.TryParseHtmlString(bg, out var bgColor))
-            {
-                img.color = bgColor;
-            }
-            img.raycastTarget = false;
-
-            if (style.Setters.TryGetValue("radius", out var radStr) &&
-                int.TryParse(radStr, out var rad) && rad > 0)
-            {
-                img.sprite = GetRoundedSprite(rad);
-                img.type = Image.Type.Sliced;
-            }
-            else
-            {
-                img.sprite = FlatSprite;
-            }
+            string key = $"tex|{tex.GetInstanceID()}|{radius}";
+            if (_bakedSpriteCache.TryGetValue(key, out var cached) && cached != null) return cached;
+            var border = new Vector4(radius, radius, radius, radius);
+            var sprite = Sprite.Create(tex, new Rect(0, 0, tex.width, tex.height),
+                new Vector2(0.5f, 0.5f), 100f, 0, SpriteMeshType.FullRect, border);
+            sprite.name = "IrisTextureSprite";
+            sprite.hideFlags = HideFlags.HideAndDontSave;
+            _bakedSpriteCache[key] = sprite;
+            return sprite;
         }
 
         private void Log(string message)
         {
-            if (LogDelegate != null) LogDelegate(message);
+            if (_rt.LogDelegate != null) _rt.LogDelegate(message);
             else Debug.Log($"[Iris.Iml] {message}");
         }
+    }
 
-        public void SetDataContext(object data)
+    // ── helper MonoBehaviours ───────────────────────────────────────────────
+
+    /// <summary>Per-frame tick: dirty rebuilds + hover/press state tracking.</summary>
+    internal sealed class ImlDriver : MonoBehaviour
+    {
+        public IrisGoRenderer Owner;
+
+        private void Update()
         {
-            _dataContext = new BindingContext(data);
-            _evaluator = new ExpressionEvaluator(_dataContext as BindingContext ?? new BindingContext(data));
-            _dataContext.PropertyChanged += OnDataContextPropertyChanged;
-            foreach (var kv in _registeredFunctions)
-                _evaluator.RegisterFunction(kv.Key, kv.Value);
-            _dirty = true;
+            if (Owner != null) Owner.Tick();
         }
+    }
 
-        public void RegisterHandler(string name, Action handler) => _handlers[name] = handler;
+    /// <summary>Custom slider drag handling (independent of Unity's Slider layout).</summary>
+    internal sealed class ImlSliderDrag : MonoBehaviour, IPointerDownHandler, IDragHandler
+    {
+        public IrisGoRenderer Owner;
+        public ImlNode Node;
+        public RectTransform Track;
 
-        public void RegisterHandler(string name, Action<object> handler) => _genericHandlers[name] = handler;
+        public void OnPointerDown(PointerEventData eventData) => Apply(eventData);
+        public void OnDrag(PointerEventData eventData) => Apply(eventData);
 
-        /// <summary>
-        /// Write a value back to the data context at the given property path.
-        /// Used by input controls (TextField, etc.) when the user submits a
-        /// new value via the on-text-submit/on-changed handler chain. Without
-        /// this, the bound CLR field (e.g. <c>Settings.judgeText.tooEarly</c>)
-        /// stays at its old value, and downstream <c>Save()</c> writes the
-        /// stale value to disk.
-        /// </summary>
-        public void SetContextValue(string propertyPath, object value)
+        private void Apply(PointerEventData eventData)
         {
-            _dataContext?.SetValue(propertyPath, value);
-        }
-
-        public void RegisterFunction(string name, Func<object[], object> func)
-        {
-            _registeredFunctions[name] = func;
-            _evaluator?.RegisterFunction(name, func);
-        }
-
-        public void RegisterDrawHandler(string name, Action<Rect, RendererInternal.DrawArgs> handler)
-        {
-            _drawHandlers[name] = handler;
-        }
-
-        public void SetHotReload(bool enabled) { }
-
-        public void LoadFile(string filePath)
-        {
-            CurrentFilePath = filePath;
-            _document = _parser.Parse(filePath);
-            _referenceCache.Clear();
-            ProcessResources();
-            _dirty = true;
-        }
-
-        public void LoadContent(string imlContent, string basePath = "")
-        {
-            _document = _parser.ParseContent(imlContent, basePath);
-            CurrentFilePath = Path.Combine(basePath, "_generated.iml");
-            ProcessResources();
-            _dirty = true;
-        }
-
-        public void Render(string filePath)
-        {
-            if (!string.Equals(CurrentFilePath, filePath, StringComparison.OrdinalIgnoreCase))
-                LoadFile(filePath);
-            RebuildUI();
-        }
-
-        /// <summary>Rebuild the UI from the currently loaded document. Use after LoadContent
-        /// to render an in-memory IML string (e.g. dynamically generated) without a file on disk.</summary>
-        public void Rebuild() => RebuildUI();
-
-        public void OnGUI() { } // No-op for GO renderer
-
-        private void ProcessResources() 
-        { 
-            if (_document?.Root == null) return;
-            // Clear before repopulating so a subsequent LoadFile doesn't carry over styles
-            // from the previous IML file.
-            _styleCache.Clear();
-            _selectorStyles.Clear();
-            _parsedRefs.Clear();
-            foreach (var child in _document.Root.Children)
-                if (child is ImlElement e && e.TagName == "Resources")
-                    ProcessResourceElement(e);
-        }
-
-        private void ProcessResourceElement(ImlElement element)
-        {
-            foreach (var child in element.Children)
-                if (child is ImlElement ce)
-                {
-                    if (ce.TagName == "Reference")
-                    {
-                        var path = ce.GetString("path");
-                        if (!string.IsNullOrEmpty(path))
-                            ProcessReferencedFile(path);
-                    }
-                    else if (ce.TagName == "Style")
-                    {
-                        var style = ParseStyle(ce);
-                        if (!string.IsNullOrEmpty(style.Name))
-                            _styleCache[style.Name.ToLowerInvariant()] = style;
-                        if (style.Selector != null)
-                            _selectorStyles.Add(style);
-                    }
-                }
-            _selectorStyles.Sort((a, b) => a.Selector.Specificity.CompareTo(b.Selector.Specificity));
-        }
-
-        private readonly Dictionary<string, ImlDocument> _referenceCache = new();
-
-        private void RenderReference(ImlElement element, Transform parent)
-        {
-            var path = element.GetString("path");
-            if (string.IsNullOrEmpty(path)) return;
-
-            try
-            {
-                var refPath = ResolveReferencePath(path);
-                if (!File.Exists(refPath))
-                {
-                    Debug.LogWarning($"[Iris.Iml] Reference file not found: {refPath}");
-                    return;
-                }
-
-                if (!_referenceCache.TryGetValue(refPath, out var refDoc))
-                {
-                    refDoc = _parser.Parse(refPath);
-                    _referenceCache[refPath] = refDoc;
-                    ProcessReferencedResources(refDoc);
-                }
-
-                if (refDoc?.Root != null)
-                    BuildElement(refDoc.Root, parent);
-            }
-            catch (Exception ex)
-            {
-                Debug.LogError($"[Iris.Iml] Failed to render reference: {path} - {ex.Message}");
-            }
-        }
-
-        private void ProcessReferencedFile(string path)
-        {
-            try
-            {
-                var refPath = ResolveReferencePath(path);
-                if (!File.Exists(refPath)) return;
-                if (_parsedRefs.Contains(refPath)) return;
-                _parsedRefs.Add(refPath);
-                var refDoc = _parser.Parse(refPath);
-                ProcessReferencedResources(refDoc);
-            }
-            catch (Exception ex)
-            {
-                Debug.LogWarning($"[Iris.Iml] Failed to process referenced resources: {path} - {ex.Message}");
-            }
-        }
-
-        private void ProcessReferencedResources(ImlDocument doc)
-        {
-            if (doc?.Root == null) return;
-            foreach (var child in doc.Root.Children)
-                if (child is ImlElement e && e.TagName == "Resources")
-                    ProcessResourceElement(e);
-        }
-
-        private string ResolveReferencePath(string path)
-        {
-            if (string.IsNullOrEmpty(path)) return path;
-            if (path.StartsWith("@/"))
-                return Path.GetFullPath(Path.Combine(
-                    Path.GetDirectoryName(CurrentFilePath) ?? "", "..", "..", path.Substring(2)));
-            if (path.StartsWith("@"))
-                return Path.GetFullPath(Path.Combine(
-                    Path.GetDirectoryName(CurrentFilePath) ?? "", path.Substring(1)));
-            return Path.GetFullPath(Path.Combine(
-                Path.GetDirectoryName(CurrentFilePath) ?? "", path));
-        }
-
-        private ImlStyle ParseStyle(ImlElement element)
-        {
-            var style = new ImlStyle
-            {
-                Name = element.GetString("name"),
-                Extends = element.GetString("extends"),
-                Selector = StyleSelector.Parse(element.GetString("on"))
-            };
-            foreach (var child in element.Children)
-                if (child is ImlElement ce)
-                {
-                    if (ce.TagName == "Setter")
-                    {
-                        var prop = ce.GetString("property");
-                        if (!string.IsNullOrEmpty(prop)) style.Setters[prop] = ce.GetString("value") ?? "";
-                    }
-                    else
-                    {
-                        var val = ce.GetString("value");
-                        if (!string.IsNullOrEmpty(val)) style.Setters[ce.TagName] = val;
-                    }
-                }
-            return style;
-        }
-
-        private Transform EnsureRoot()
-        {
-            if (_rootObject == null)
-            {
-                _rootObject = new GameObject("IrisCanvas");
-                _rootObject.transform.SetParent(ParentTransform, false);
-                UnityEngine.Object.DontDestroyOnLoad(_rootObject);
-                var canvas = _rootObject.AddComponent<Canvas>();
-                canvas.renderMode = RenderMode.ScreenSpaceOverlay;
-                canvas.sortingOrder = 32767;
-                _rootObject.AddComponent<CanvasScaler>();
-                _rootObject.AddComponent<GraphicRaycaster>();
-
-                // Full-screen overlay background
-                var bgGo = new GameObject("OverlayBG");
-                var bgImg = bgGo.AddComponent<Image>();
-                bgImg.color = new Color(0, 0, 0, 0.5f);
-                var bgRect = bgImg.rectTransform;
-                bgRect.anchorMin = Vector2.zero;
-                bgRect.anchorMax = Vector2.one;
-                bgRect.sizeDelta = Vector2.zero;
-                bgGo.transform.SetParent(_rootObject.transform, false);
-            }
-            return _rootObject.transform;
-        }
-
-        private void RebuildUI()
-        {
-            if (_document?.Root == null || _dataContext == null)
-            {
-                Debug.LogWarning("[IrisGoRenderer] RebuildUI skipped: document or dataContext null");
+            if (Owner == null || Node == null) return;
+            var rt = Track != null ? Track : (RectTransform)transform;
+            if (!RectTransformUtility.ScreenPointToLocalPointInRectangle(
+                    rt, eventData.position, eventData.pressEventCamera, out var local))
                 return;
-            }
+            float w = rt.rect.width;
+            if (w <= 0f) return;
+            float t = Mathf.Clamp01(local.x / w);
+            float value = Node.Min + t * (Node.Max - Node.Min);
+            if (Node.Step > 0f)
+                value = Node.Min + Mathf.Round((value - Node.Min) / Node.Step) * Node.Step;
+            Owner.OnSliderChanged(Node, Mathf.Clamp(value, Node.Min, Node.Max));
+        }
+    }
 
-            var root = EnsureRoot();
+    /// <summary>Swaps a text field's background sprite while focused.</summary>
+    internal sealed class ImlSelectFx : MonoBehaviour, ISelectHandler, IDeselectHandler
+    {
+        public Image Target;
+        public Sprite Normal;
+        public Sprite Focused;
 
-            // Destroy old children (keep overlay BG at index 0)
-            for (int i = root.childCount - 1; i >= 1; i--)
-                UnityEngine.Object.Destroy(root.GetChild(i).gameObject);
-
-            try
-            {
-                // DialogWrapper: anchored at screen center, sized by its content's preferred size.
-                // No LayoutGroup on the wrapper — we rely on anchored centering + ContentSizeFitter,
-                // which is the most reliable way to center a dialog in UGUI.
-                var wrapperGo = new GameObject("DialogWrapper");
-                var wrapperRect = wrapperGo.AddComponent<RectTransform>();
-                wrapperRect.anchorMin = new Vector2(0.5f, 0.5f);
-                wrapperRect.anchorMax = new Vector2(0.5f, 0.5f);
-                wrapperRect.pivot = new Vector2(0.5f, 0.5f);
-                wrapperRect.anchoredPosition = Vector2.zero;
-                wrapperRect.sizeDelta = Vector2.zero;
-                var wrapperCsf = wrapperGo.AddComponent<ContentSizeFitter>();
-                wrapperCsf.horizontalFit = ContentSizeFitter.FitMode.PreferredSize;
-                wrapperCsf.verticalFit = ContentSizeFitter.FitMode.PreferredSize;
-                wrapperGo.transform.SetParent(root, false);
-
-                BuildElement(_document.Root, wrapperGo.transform);
-            }
-            catch (Exception ex)
-            {
-                Debug.LogError($"[IrisGoRenderer] RebuildUI error: {ex}");
-            }
-            _dirty = false;
+        public void OnSelect(BaseEventData eventData)
+        {
+            if (Target != null && Focused != null) Target.sprite = Focused;
         }
 
-        private void BuildElement(ImlElement element, Transform parent)
+        public void OnDeselect(BaseEventData eventData)
         {
-            if (element == null) return;
-
-            // Handle If conditions
-            if (element.TagName == "If")
-            {
-                var cond = element.GetExpression("condition");
-                if (!string.IsNullOrEmpty(cond) && !_evaluator.EvaluateBoolean(cond))
-                    return;
-            }
-
-            // Handle visible
-            if (element.HasAttribute("visible"))
-            {
-                var vis = element.GetExpression("visible");
-                if (!string.IsNullOrEmpty(vis) && !_evaluator.EvaluateBoolean(vis))
-                    return;
-            }
-
-            switch (element.TagName)
-            {
-                case "Iris":
-                case "If":
-                    BuildChildren(element, parent);
-                    break;
-
-                case "HBox":
-                case "VBox":
-                case "View":
-                    BuildContainer(element, parent);
-                    break;
-
-                case "Text":
-                    BuildText(element, parent);
-                    break;
-
-                case "Button":
-                    BuildButton(element, parent);
-                    break;
-
-                case "Switch":
-                case "Checkbox":
-                    BuildToggle(element, parent);
-                    break;
-
-                case "Slider":
-                    BuildSlider(element, parent);
-                    break;
-
-                case "TextField":
-                    BuildTextField(element, parent);
-                    break;
-
-                case "Separator":
-                    BuildSeparator(element, parent);
-                    break;
-
-                case "Spacer":
-                case "Box":
-                    BuildSpacer(element, parent);
-                    break;
-
-                case "Icon":
-                    BuildIcon(element, parent);
-                    break;
-
-                case "Image":
-                    BuildImage(element, parent);
-                    break;
-
-                case "ScrollView":
-                    BuildScrollView(element, parent);
-                    break;
-
-                case "Fill":
-                    // Flexible space: add an expanding layout element.
-                    // In a HorizontalLayoutGroup, only flexibleWidth matters;
-                    // in a VerticalLayoutGroup, only flexibleHeight matters.
-                    // Set both so <Fill /> works in either direction.
-                    var fill = new GameObject("Fill", typeof(LayoutElement));
-                    var leFill = fill.GetComponent<LayoutElement>();
-                    var parentLg = parent.GetComponent<HorizontalOrVerticalLayoutGroup>();
-                    if (parentLg is HorizontalLayoutGroup)
-                    {
-                        leFill.flexibleWidth = 1;
-                    }
-                    else if (parentLg is VerticalLayoutGroup)
-                    {
-                        leFill.flexibleHeight = 1;
-                    }
-                    else
-                    {
-                        // Fallback: expand both axes
-                        leFill.flexibleWidth = 1;
-                        leFill.flexibleHeight = 1;
-                    }
-                    fill.transform.SetParent(parent, false);
-                    break;
-
-                case "ArrowButton":
-                    BuildArrowButton(element, parent);
-                    break;
-
-                case "Selector":
-                    BuildSelector(element, parent);
-                    break;
-
-                case "Reference":
-                    RenderReference(element, parent);
-                    break;
-
-                // Meta tags — skip
-                case "Resources":
-                case "Style":
-                case "Template":
-                case "StyleSelector":
-                case "Case":
-                case "Slot":
-                case "References":
-                    break;
-
-                default:
-                    Debug.LogWarning($"[Iris.Iml] Unknown element: {element.TagName}");
-                    break;
-            }
-        }
-
-        private void BuildChildren(ImlElement element, Transform parent)
-        {
-            foreach (var child in element.Children)
-            {
-                if (child is ImlElement e) BuildElement(e, parent);
-                else if (child is string t && !string.IsNullOrWhiteSpace(t))
-                {
-                    var go = new GameObject("Text");
-                    var txt = go.AddComponent<Text>();
-                    txt.text = t;
-                    txt.color = Color.white;
-                    txt.font = DefaultFont;
-                    txt.fontSize = 14;
-                    go.transform.SetParent(parent, false);
-                }
-            }
-        }
-
-        private string GetChildText(object child)
-        {
-            if (child is string s) return s;
-            if (child is ExpressionValue ev && !string.IsNullOrWhiteSpace(ev.Expression))
-            {
-                try { return _evaluator.Evaluate(ev.Expression)?.ToString() ?? ""; }
-                catch { return ""; }
-            }
-            return "";
-        }
-
-        private void BuildContainer(ImlElement element, Transform parent)
-        {
-            bool isHorizontal = element.TagName == "HBox";
-            var go = new GameObject(element.TagName);
-
-            HorizontalOrVerticalLayoutGroup lg;
-            if (isHorizontal)
-            {
-                var hlg = go.AddComponent<HorizontalLayoutGroup>();
-                hlg.childForceExpandWidth = false;
-                hlg.childForceExpandHeight = true;
-                lg = hlg;
-            }
-            else
-            {
-                var vlg = go.AddComponent<VerticalLayoutGroup>();
-                vlg.childForceExpandWidth = true;
-                vlg.childForceExpandHeight = false;
-                lg = vlg;
-            }
-
-            var csf = go.AddComponent<ContentSizeFitter>();
-            csf.horizontalFit = ContentSizeFitter.FitMode.PreferredSize;
-            csf.verticalFit = ContentSizeFitter.FitMode.PreferredSize;
-
-            var style = GetEffectiveStyle(element);
-
-            // fixed width / height (from inline attribute, supports {expr})
-            var wStr = element.HasAttribute("width") ? ResolveAttributeValue(element, "width") : "";
-            var hStr = element.HasAttribute("height") ? ResolveAttributeValue(element, "height") : "";
-            if (!string.IsNullOrEmpty(wStr) || !string.IsNullOrEmpty(hStr))
-            {
-                var le = go.AddComponent<LayoutElement>();
-                if (float.TryParse(wStr, out var w) && w > 0)
-                {
-                    le.preferredWidth = w;
-                    le.minWidth = w;
-                }
-                if (float.TryParse(hStr, out var h) && h > 0)
-                {
-                    le.preferredHeight = h;
-                    le.minHeight = h;
-                }
-            }
-
-            // gap (from inline or style)
-            var gapStr = element.GetString("gap");
-            if (string.IsNullOrEmpty(gapStr)) style?.Setters?.TryGetValue("gap", out gapStr);
-            if (int.TryParse(gapStr, out var gap) && gap > 0) lg.spacing = gap;
-
-            // padding / margin from style
-            ApplyContainerPadding(element, style, lg, "padding");
-            ApplyContainerPadding(element, style, lg, "margin");
-
-            // flex alignment
-            ApplyFlexAlignment(style, lg, isHorizontal);
-
-            // common style + background
-            ApplyCommonStyle(go, element);
-
-            if (style?.Setters != null && style.Setters.ContainsKey("background"))
-            {
-                var img = go.AddComponent<Image>();
-                ApplyBackgroundStyle(img, style);
-            }
-
-            go.transform.SetParent(parent, false);
-
-            // Slot images + flow children
-            var bgSlots = new List<ImlElement>();
-            var fgSlots = new List<ImlElement>();
-            var flowChildren = new List<object>();
-            foreach (var child in element.Children)
-            {
-                if (child is ImlElement ce)
-                {
-                    var slot = ce.GetString("slot")?.ToLowerInvariant();
-                    if (slot == "background") bgSlots.Add(ce);
-                    else if (slot == "foreground") fgSlots.Add(ce);
-                    else flowChildren.Add(ce);
-                }
-                else flowChildren.Add(child);
-            }
-
-            foreach (var bg in bgSlots) BuildSlotImage(bg, go.transform);
-            foreach (var child in flowChildren)
-            {
-                if (child is ImlElement e) BuildElement(e, go.transform);
-                else
-                {
-                    var text = GetChildText(child);
-                    if (!string.IsNullOrEmpty(text))
-                    {
-                        var txtGo = new GameObject("Text");
-                        var txt = txtGo.AddComponent<Text>();
-                        txt.text = text;
-                        txt.color = Color.white;
-                        txt.font = DefaultFont;
-                        txtGo.transform.SetParent(go.transform, false);
-                    }
-                }
-            }
-            foreach (var fg in fgSlots) BuildSlotImage(fg, go.transform);
-        }
-
-        private void BuildText(ImlElement element, Transform parent)
-        {
-            var text = ResolveAttributeValue(element, "text");
-            var go = new GameObject("Text");
-            var txt = go.AddComponent<Text>();
-            txt.text = text;
-            txt.color = Color.white;
-            txt.font = DefaultFont;
-            txt.supportRichText = element.GetString("richText") == "true";
-
-            var style = GetEffectiveStyle(element);
-            if (style.Setters.TryGetValue("fontSize", out var fs) && int.TryParse(fs, out var fontSize))
-                txt.fontSize = fontSize;
-            if (TryParseColor(style, out var color))
-                txt.color = color;
-
-            go.transform.SetParent(parent, false);
-        }
-
-        private static bool TryParseColor(ImlStyle style, out Color color)
-        {
-            color = Color.white;
-            if (style.Setters.TryGetValue("color", out var cs) && !string.IsNullOrEmpty(cs))
-            {
-                if (cs.StartsWith("#") && ColorUtility.TryParseHtmlString(cs, out var c))
-                {
-                    color = c;
-                    return true;
-                }
-            }
-            return false;
-        }
-
-        private static bool TryParseBackground(ImlStyle style, out Color color)
-        {
-            color = Color.white;
-            if (style.Setters.TryGetValue("background", out var bg) && !string.IsNullOrEmpty(bg))
-            {
-                if (bg.StartsWith("#") && ColorUtility.TryParseHtmlString(bg, out var c))
-                {
-                    color = c;
-                    return true;
-                }
-            }
-            return false;
-        }
-
-        private void BuildButton(ImlElement element, Transform parent)
-        {
-            var text = ResolveAttributeValue(element, "text");
-            var go = new GameObject("Button");
-
-            // Image first (the Button component will set targetGraphic to this)
-            var img = go.AddComponent<Image>();
-
-            var btnStyle = GetEffectiveStyle(element);
-            ApplyBackgroundStyle(img, btnStyle);
-            // ApplyBackgroundStyle flips raycastTarget to false (it assumes background-only
-            // panels). Re-enable it for buttons so clicks actually register on the targetGraphic.
-            img.raycastTarget = true;
-
-            // Force a minimum/preferred height so the button doesn't collapse
-            var le = go.AddComponent<LayoutElement>();
-            var widthStr = element.GetString("width");
-            if (float.TryParse(widthStr, out var btnW) && btnW > 0)
-            {
-                le.preferredWidth = btnW;
-                le.minWidth = btnW;
-            }
-            le.minHeight = 32;
-            le.preferredHeight = 32;
-
-            // Button component for click events
-            var btn = go.AddComponent<Button>();
-            btn.targetGraphic = img;
-            btn.onClick.AddListener(() => HandleElementEvents(element));
-
-            // Text child — stretched to fill the button, centered alignment
-            var txtGo = new GameObject("Text");
-            var txtRect = txtGo.AddComponent<RectTransform>();
-            txtRect.anchorMin = Vector2.zero;
-            txtRect.anchorMax = Vector2.one;
-            txtRect.offsetMin = Vector2.zero;
-            txtRect.offsetMax = Vector2.zero;
-            var txt = txtGo.AddComponent<Text>();
-            txt.text = text;
-            txt.alignment = TextAnchor.MiddleCenter;
-            txt.font = DefaultFont;
-            txt.horizontalOverflow = HorizontalWrapMode.Overflow;
-            txt.verticalOverflow = VerticalWrapMode.Overflow;
-
-            if (btnStyle.Setters.TryGetValue("fontSize", out var fs2) && int.TryParse(fs2, out var fontSize2))
-                txt.fontSize = fontSize2;
-            if (TryParseColor(btnStyle, out var color2))
-                txt.color = color2;
-
-            txtGo.transform.SetParent(go.transform, false);
-            go.transform.SetParent(parent, false);
-        }
-
-        private void BuildToggle(ImlElement element, Transform parent)
-        {
-            var text = ResolveAttributeValue(element, "text");
-            var valueBinding = element.GetExpression("value");
-            var onChanged = element.GetString("on-changed");
-
-            bool currentValue = false;
-            if (!string.IsNullOrEmpty(valueBinding))
-            {
-                var val = _evaluator.Evaluate(valueBinding);
-                currentValue = val is bool b && b;
-            }
-
-            var go = new GameObject(element.TagName);
-            var tog = go.AddComponent<Toggle>();
-            tog.isOn = currentValue;
-
-            if (!string.IsNullOrEmpty(text))
-            {
-                var labelGo = new GameObject("Label");
-                var lbl = labelGo.AddComponent<Text>();
-                lbl.text = text;
-                lbl.color = Color.white;
-                lbl.font = DefaultFont;
-                labelGo.transform.SetParent(go.transform, false);
-            }
-
-            tog.onValueChanged.AddListener(val =>
-            {
-                if (!string.IsNullOrEmpty(onChanged))
-                    ScheduleEffect(() => InvokeHandler(onChanged, val));
-            });
-
-            go.transform.SetParent(parent, false);
-        }
-
-        private void BuildSlider(ImlElement element, Transform parent)
-        {
-            var valueBinding = element.GetExpression("value");
-            var minStr = element.GetString("min");
-            var maxStr = element.GetString("max");
-            var onChanged = element.GetString("on-changed");
-
-            float min = float.TryParse(minStr, out var mn) ? mn : 0;
-            float max = float.TryParse(maxStr, out var mx) ? mx : 100;
-
-            float currentValue = min;
-            if (!string.IsNullOrEmpty(valueBinding))
-            {
-                var val = _evaluator.Evaluate(valueBinding);
-                currentValue = Convert.ToSingle(val);
-            }
-
-            var go = new GameObject("Slider");
-            var sl = go.AddComponent<Slider>();
-
-            // Background — provides the raycast target so the slider is clickable
-            var bg = new GameObject("Background", typeof(Image));
-            var bgRect = bg.GetComponent<RectTransform>();
-            bgRect.anchorMin = Vector2.zero;
-            bgRect.anchorMax = Vector2.one;
-            bgRect.offsetMin = new Vector2(10, 0);
-            bgRect.offsetMax = new Vector2(-10, 0);
-            var bgImg = bg.GetComponent<Image>();
-            bgImg.color = new Color(0.2f, 0.2f, 0.2f, 1);
-            bg.transform.SetParent(go.transform, false);
-
-            // Fill Area
-            var fillArea = new GameObject("Fill Area", typeof(RectTransform));
-            var fillAreaRect = fillArea.GetComponent<RectTransform>();
-            fillAreaRect.anchorMin = Vector2.zero;
-            fillAreaRect.anchorMax = Vector2.one;
-            fillAreaRect.offsetMin = new Vector2(10, 2);
-            fillAreaRect.offsetMax = new Vector2(-10, -2);
-            fillArea.transform.SetParent(go.transform, false);
-
-            var fill = new GameObject("Fill", typeof(Image));
-            var fillRect = fill.GetComponent<RectTransform>();
-            fillRect.anchorMin = Vector2.zero;
-            fillRect.anchorMax = Vector2.one;
-            fillRect.offsetMin = Vector2.zero;
-            fillRect.offsetMax = Vector2.zero;
-            var fillImg = fill.GetComponent<Image>();
-            fillImg.color = new Color(0.4f, 0.6f, 1f, 1);
-            fill.transform.SetParent(fillArea.transform, false);
-
-            // Handle
-            var handleArea = new GameObject("Handle Slide Area", typeof(RectTransform));
-            var handleAreaRect = handleArea.GetComponent<RectTransform>();
-            handleAreaRect.anchorMin = Vector2.zero;
-            handleAreaRect.anchorMax = Vector2.one;
-            handleAreaRect.offsetMin = new Vector2(10, 0);
-            handleAreaRect.offsetMax = new Vector2(-10, 0);
-            handleArea.transform.SetParent(go.transform, false);
-
-            var handle = new GameObject("Handle", typeof(Image));
-            var handleRect2 = handle.GetComponent<RectTransform>();
-            handleRect2.anchorMin = new Vector2(0, 0);
-            handleRect2.anchorMax = new Vector2(0, 1);
-            handleRect2.pivot = new Vector2(0.5f, 0.5f);
-            handleRect2.sizeDelta = new Vector2(20, 0);
-            var handleImg = handle.GetComponent<Image>();
-            handleImg.color = new Color(0.8f, 0.9f, 1f, 1);
-            handle.transform.SetParent(handleArea.transform, false);
-
-            sl.handleRect = handleRect2;
-            sl.fillRect = fillRect;
-            sl.targetGraphic = handleImg;
-            sl.minValue = min;
-            sl.maxValue = max;
-            sl.value = currentValue;
-
-            // Layout: give the slider a minimum size
-            var le = go.AddComponent<LayoutElement>();
-            le.minWidth = 120;
-            le.minHeight = 24;
-            le.flexibleWidth = 1;
-
-            // Show value text if requested
-            var showValue = element.GetString("showValue");
-            if (showValue == "true")
-            {
-                var valGo = new GameObject("ValueText", typeof(Text));
-                var valText = valGo.GetComponent<Text>();
-                valText.font = DefaultFont;
-                valText.fontSize = 12;
-                valText.color = Color.white;
-                valText.alignment = TextAnchor.MiddleRight;
-                var valRect = valGo.GetComponent<RectTransform>();
-                valRect.anchorMin = Vector2.zero;
-                valRect.anchorMax = Vector2.one;
-                valRect.offsetMin = Vector2.zero;
-                valRect.offsetMax = Vector2.zero;
-                sl.onValueChanged.AddListener(v =>
-                {
-                    valText.text = v.ToString("F0");
-                });
-                valText.text = currentValue.ToString("F0");
-                valGo.transform.SetParent(go.transform, false);
-            }
-
-            sl.onValueChanged.AddListener(val =>
-            {
-                if (!string.IsNullOrEmpty(onChanged))
-                    ScheduleEffect(() => InvokeHandler(onChanged, val));
-            });
-
-            go.transform.SetParent(parent, false);
-        }
-
-        private void BuildTextField(ImlElement element, Transform parent)
-        {
-            var valueBinding = element.GetExpression("value");
-            var onSubmit = element.GetString("on-text-submit");
-
-            string currentValue = "";
-            if (!string.IsNullOrEmpty(valueBinding))
-            {
-                var val = _evaluator.Evaluate(valueBinding);
-                currentValue = val?.ToString() ?? "";
-            }
-
-            var go = new GameObject("InputField");
-            var input = go.AddComponent<InputField>();
-            var txtGo = new GameObject("Text");
-            var txt = txtGo.AddComponent<Text>();
-            txt.text = currentValue;
-            txt.font = DefaultFont;
-            txtGo.transform.SetParent(go.transform, false);
-            input.textComponent = txt;
-
-            input.onEndEdit.AddListener(val =>
-            {
-                // Two-way binding: the value="..." expression we evaluated above
-                // for the initial read must be written back to the data context
-                // BEFORE the on-text-submit handler runs. Without this, handlers
-                // like Settings.OnJudgeTextChanged can only call Save() — they
-                // never see the new value, so the underlying CLR field (e.g.
-                // judgeText.tooEarly) stays at its old value and gets serialized
-                // back to disk on save. (Bug: "判定文本无法修改".)
-                if (!string.IsNullOrEmpty(valueBinding))
-                    SetContextValue(valueBinding, val);
-                if (!string.IsNullOrEmpty(onSubmit))
-                    ScheduleEffect(() => InvokeHandler(onSubmit, val));
-            });
-
-            go.transform.SetParent(parent, false);
-        }
-
-        private void BuildScrollView(ImlElement element, Transform parent)
-        {
-            var go = new GameObject("ScrollView", typeof(ScrollRect));
-            var sr = go.GetComponent<ScrollRect>();
-
-            var vpGo = new GameObject("Viewport");
-            var vpMask = vpGo.AddComponent<Mask>();
-            vpMask.showMaskGraphic = false;
-            var vpImg = vpGo.AddComponent<Image>();
-            vpImg.color = Color.white;
-            var vpRect = vpImg.rectTransform;
-            vpRect.anchorMin = Vector2.zero;
-            vpRect.anchorMax = Vector2.one;
-            vpRect.sizeDelta = Vector2.zero;
-            vpGo.transform.SetParent(go.transform, false);
-            sr.viewport = vpRect;
-
-            var contentGo = new GameObject("Content");
-            var contentLayout = contentGo.AddComponent<VerticalLayoutGroup>();
-            contentLayout.childForceExpandWidth = true;
-            contentLayout.childForceExpandHeight = false;
-            var csf = contentGo.AddComponent<ContentSizeFitter>();
-            csf.horizontalFit = ContentSizeFitter.FitMode.Unconstrained;
-            csf.verticalFit = ContentSizeFitter.FitMode.PreferredSize;
-            contentGo.transform.SetParent(vpGo.transform, false);
-            sr.content = contentGo.GetComponent<RectTransform>();
-
-            // Add a background image to the scroll view
-            var bgImg = go.AddComponent<Image>();
-            bgImg.color = new Color(0.08f, 0.08f, 0.08f, 1);
-
-            go.transform.SetParent(parent, false);
-
-            foreach (var child in element.Children)
-            {
-                if (child is ImlElement e) BuildElement(e, contentGo.transform);
-            }
-        }
-
-        private void BuildSpacer(ImlElement element, Transform parent)
-        {
-            var heightStr = element.GetString("height");
-            var go = new GameObject("Spacer");
-            var le = go.AddComponent<LayoutElement>();
-            if (float.TryParse(heightStr, out var h) && h > 0)
-                le.minHeight = h;
-            else
-                le.minHeight = 10;
-            le.flexibleWidth = 1;
-            go.transform.SetParent(parent, false);
-        }
-
-        private void BuildSeparator(ImlElement element, Transform parent)
-        {
-            var go = new GameObject("Separator");
-            var img = go.AddComponent<Image>();
-            img.color = new Color(1, 1, 1, 0.2f);
-            var le = go.AddComponent<LayoutElement>();
-            le.minHeight = 1;
-            le.flexibleWidth = 1;
-            go.transform.SetParent(parent, false);
-        }
-
-        private void BuildIcon(ImlElement element, Transform parent)
-        {
-            // The IML spec allows attribute values like type="{iconType}" — these are
-            // expressions, not strings, so GetString (which only reads StringValue) would
-            // return "" and the icon would always fall through to the default (gray "?").
-            // Use ResolveAttributeValue so expressions are evaluated against the data context.
-            var typeAttr = ResolveAttributeValue(element, "type");
-            var style = NormalizeIconType(typeAttr);
-
-            const float iconSize = 24f;
-            var go = new GameObject("Icon");
-            var img = go.AddComponent<Image>();
-            img.sprite = GetIconSprite(style);
-            img.type = Image.Type.Simple;
-            img.raycastTarget = false;
-
-            var le = go.AddComponent<LayoutElement>();
-            le.preferredWidth = iconSize;
-            le.preferredHeight = iconSize;
-            le.minWidth = iconSize;
-            le.minHeight = iconSize;
-
-            go.transform.SetParent(parent, false);
-        }
-
-private static string NormalizeIconType(string typeAttr)
-        {
-            return typeAttr?.ToLowerInvariant() switch
-            {
-                "information" or "info" or "informational" or "i" => "information",
-                "success" or "succes" or "check" or "ok" => "success",
-                "warning" or "warn" or "!" => "warning",
-                "error" or "err" or "fail" or "x" => "error",
-                "stop" or "block" or "square" => "stop",
-                _ => "information",
-            };
-        }
-
-        private void BuildArrowButton(ImlElement element, Transform parent)
-        {
-            var dir = (element.GetString("direction") ?? "right").ToLowerInvariant();
-            var arrowChar = dir switch
-            {
-                "down" => "▼",
-                "left" => "◀",
-                "up" => "▲",
-                _ => "▶"
-            };
-
-            var go = new GameObject("ArrowButton");
-            var img = go.AddComponent<Image>();
-
-            var style = GetEffectiveStyle(element);
-            ApplyBackgroundStyle(img, style);
-            img.raycastTarget = true;
-
-            var le = go.AddComponent<LayoutElement>();
-            le.preferredWidth = 24;
-            le.preferredHeight = 24;
-            le.minWidth = 24;
-            le.minHeight = 24;
-
-            var btn = go.AddComponent<Button>();
-            btn.targetGraphic = img;
-            btn.onClick.AddListener(() => HandleElementEvents(element));
-
-            var txtGo = new GameObject("Arrow");
-            var txtRect = txtGo.AddComponent<RectTransform>();
-            txtRect.anchorMin = Vector2.zero;
-            txtRect.anchorMax = Vector2.one;
-            txtRect.offsetMin = Vector2.zero;
-            txtRect.offsetMax = Vector2.zero;
-            var txt = txtGo.AddComponent<Text>();
-            txt.text = arrowChar;
-            txt.alignment = TextAnchor.MiddleCenter;
-            txt.font = DefaultFont;
-            txt.fontSize = 14;
-            txt.color = Color.white;
-            txt.horizontalOverflow = HorizontalWrapMode.Overflow;
-            txt.verticalOverflow = VerticalWrapMode.Overflow;
-            txtGo.transform.SetParent(go.transform, false);
-
-            go.transform.SetParent(parent, false);
-        }
-
-        private void BuildSelector(ImlElement element, Transform parent)
-        {
-            var valueBinding = element.GetExpression("value");
-            var itemsStr = element.GetExpression("items");
-            var onChanged = element.GetString("on-changed");
-
-            if (string.IsNullOrEmpty(itemsStr)) return;
-            var itemsObj = _evaluator.Evaluate(itemsStr);
-            if (itemsObj is not IList items) return;
-
-            string currentStr = "";
-            if (!string.IsNullOrEmpty(valueBinding))
-            {
-                var val = _evaluator.Evaluate(valueBinding);
-                currentStr = val?.ToString() ?? "";
-            }
-
-            var container = new GameObject("Selector");
-            var hlg = container.AddComponent<HorizontalLayoutGroup>();
-            hlg.childForceExpandWidth = false;
-            hlg.childForceExpandHeight = true;
-            hlg.spacing = 4;
-
-            var csf = container.AddComponent<ContentSizeFitter>();
-            csf.horizontalFit = ContentSizeFitter.FitMode.PreferredSize;
-            csf.verticalFit = ContentSizeFitter.FitMode.PreferredSize;
-
-            container.transform.SetParent(parent, false);
-
-            for (int i = 0; i < items.Count; i++)
-            {
-                var item = items[i];
-                string key, display;
-
-                if (item is string s)
-                {
-                    key = s;
-                    display = s;
-                }
-                else if (item != null)
-                {
-                    var t = item.GetType();
-                    var keyProp = t.GetProperty("key");
-                    var displayProp = t.GetProperty("displayName");
-                    key = keyProp?.GetValue(item)?.ToString() ?? item.ToString();
-                    display = displayProp?.GetValue(item)?.ToString() ?? item.ToString();
-                }
-                else continue;
-
-                bool isSelected = key == currentStr;
-                var btnGo = new GameObject("Btn_" + key);
-                var img = btnGo.AddComponent<Image>();
-                img.color = isSelected ? new Color(0.85f, 0.45f, 0.65f) : new Color(0.19f, 0.20f, 0.22f);
-                img.raycastTarget = true;
-
-                var le = btnGo.AddComponent<LayoutElement>();
-                le.minHeight = 24;
-
-                var btn = btnGo.AddComponent<Button>();
-                btn.targetGraphic = img;
-                string capturedKey = key;
-                btn.onClick.AddListener(() =>
-                {
-                    if (!string.IsNullOrEmpty(valueBinding))
-                        SetContextValue(valueBinding, capturedKey);
-                    if (!string.IsNullOrEmpty(onChanged))
-                        ScheduleEffect(() => InvokeHandler(onChanged, capturedKey));
-                });
-
-                var txtGo = new GameObject("Text");
-                var txtRect = txtGo.AddComponent<RectTransform>();
-                txtRect.anchorMin = Vector2.zero;
-                txtRect.anchorMax = Vector2.one;
-                txtRect.offsetMin = new Vector2(6, 2);
-                txtRect.offsetMax = new Vector2(-6, -2);
-                var txt = txtGo.AddComponent<Text>();
-                txt.text = display;
-                txt.alignment = TextAnchor.MiddleCenter;
-                txt.font = DefaultFont;
-                txt.fontSize = 12;
-                txt.color = isSelected ? Color.white : new Color(0.91f, 0.93f, 0.94f);
-                txt.horizontalOverflow = HorizontalWrapMode.Overflow;
-                txtGo.transform.SetParent(btnGo.transform, false);
-
-                btnGo.transform.SetParent(container.transform, false);
-            }
-        }
-
-        private void BuildImage(ImlElement element, Transform parent)
-        {
-            var source = element.GetString("source");
-            var go = new GameObject("Image");
-
-            if (!string.IsNullOrEmpty(source))
-            {
-                var tex = LoadTexture(source);
-                if (tex != null)
-                {
-                    var raw = go.AddComponent<RawImage>();
-                    raw.texture = tex;
-                }
-            }
-
-            go.transform.SetParent(parent, false);
-        }
-
-        private string ResolveAttributeValue(ImlElement element, string attrName)
-        {
-            if (!element.Attributes.TryGetValue(attrName, out var attr)) return "";
-            switch (attr.Type)
-            {
-                case AttributeType.String: return attr.StringValue ?? "";
-                case AttributeType.Expression:
-                    try { return _evaluator.Evaluate(attr.Expression)?.ToString() ?? ""; }
-                    catch { return ""; }
-                case AttributeType.Template:
-                    if (attr.Parts == null) return "";
-                    var sb = new System.Text.StringBuilder();
-                    foreach (var part in attr.Parts)
-                    {
-                        if (part.IsExpression)
-                        {
-                            try { sb.Append(_evaluator.Evaluate(part.Value)?.ToString() ?? ""); }
-                            catch { }
-                        }
-                        else sb.Append(part.Value);
-                    }
-                    return sb.ToString();
-                case AttributeType.Boolean: return attr.BoolValue ? "true" : "false";
-                case AttributeType.StyleObject: return "";
-                default: return attr.StringValue ?? "";
-            }
-        }
-
-        private ImlStyle GetEffectiveStyle(ImlElement element)
-        {
-            var merged = new ImlStyle();
-            var tag = element.TagName?.ToLowerInvariant();
-            var cls = element.GetString("class")?.ToLowerInvariant();
-            var id = element.GetString("id")?.ToLowerInvariant();
-
-            foreach (var ss in _selectorStyles)
-            {
-                if (ss.Selector != null && ss.Selector.Matches(tag, cls, id))
-                    foreach (var kv in ss.Setters)
-                        merged.Setters[kv.Key] = kv.Value;
-            }
-
-            if (element.Attributes.TryGetValue("style", out var styleAttr))
-            {
-                if (styleAttr.Type == AttributeType.String || styleAttr.Type == AttributeType.Expression)
-                {
-                    var sn = ResolveAttributeValue(element, "style");
-                    if (!string.IsNullOrEmpty(sn) && _styleCache.TryGetValue(sn.ToLowerInvariant(), out var namedStyle))
-                        foreach (var kv in namedStyle.Setters)
-                            merged.Setters[kv.Key] = kv.Value;
-                }
-                else if (styleAttr.Type == AttributeType.StyleObject && styleAttr.StyleEntries != null)
-                {
-                    foreach (var entry in styleAttr.StyleEntries)
-                        if (!string.IsNullOrEmpty(entry.Property))
-                            merged.Setters[entry.Property] = entry.Value;
-                }
-            }
-
-            return merged;
-        }
-
-        private void HandleElementEvents(ImlElement element)
-        {
-            foreach (var kv in element.Attributes)
-            {
-                if (kv.Key.StartsWith("on-") && !kv.Key.StartsWith("data-on-"))
-                {
-                    var spec = ResolveAttributeValue(element, kv.Key);
-                    if (!string.IsNullOrEmpty(spec)) InvokeHandlerString(spec);
-                }
-            }
-        }
-
-        private void InvokeHandlerString(string spec)
-        {
-            string name = spec;
-            string arg = null;
-            var pi = spec.IndexOf('(');
-            if (pi > 0 && spec.EndsWith(")"))
-            {
-                name = spec.Substring(0, pi).Trim();
-                var a = spec.Substring(pi + 1, spec.Length - pi - 2).Trim();
-                if ((a.StartsWith("'") && a.EndsWith("'")) || (a.StartsWith("\"") && a.EndsWith("\"")))
-                    arg = a.Substring(1, a.Length - 2);
-                else if (!string.IsNullOrEmpty(a))
-                {
-                    var ev = _evaluator.Evaluate(a);
-                    arg = ev?.ToString();
-                }
-            }
-            if (arg != null) InvokeHandler(name, arg);
-            else InvokeHandler(name, null);
-        }
-
-        private void InvokeHandler(string name, object param)
-        {
-            if (_handlers.TryGetValue(name, out var h)) h();
-            else if (_genericHandlers.TryGetValue(name, out var gh)) gh(param);
-        }
-
-        private void ScheduleEffect(Action effect) { try { effect(); } catch { } }
-
-        private void OnDataContextPropertyChanged(string path, object oldVal, object newVal) => _dirty = true;
-
-        // ========== CSS-like style helpers ==========
-
-        private void ApplyCommonStyle(GameObject go, ImlElement element)
-        {
-            var style = GetEffectiveStyle(element);
-            if (style?.Setters == null) return;
-
-            if (style.Setters.TryGetValue("display", out var disp) && disp == "none")
-            { go.SetActive(false); return; }
-
-            var le = GetOrAddLayoutElement(go);
-
-            if (TryStyleFloat(style, "width", out var w) && w > 0) le.preferredWidth = w;
-            if (TryStyleFloat(style, "height", out var h) && h > 0) le.preferredHeight = h;
-            if (TryStyleFloat(style, "minWidth", out var minW) && minW > 0) le.minWidth = minW;
-            if (TryStyleFloat(style, "minHeight", out var minH) && minH > 0) le.minHeight = minH;
-
-            if (style.Setters.TryGetValue("flexGrow", out var fg) && float.TryParse(fg, out var grow) && grow > 0)
-            {
-                var pLg = go.transform.parent?.GetComponent<HorizontalOrVerticalLayoutGroup>();
-                if (pLg is HorizontalLayoutGroup) le.flexibleWidth = grow;
-                else if (pLg is VerticalLayoutGroup) le.flexibleHeight = grow;
-                else { le.flexibleWidth = grow; le.flexibleHeight = grow; }
-            }
-
-            if (TryStyleFloat(style, "opacity", out var alpha) && alpha < 1f)
-                (go.GetComponent<CanvasGroup>() ?? go.AddComponent<CanvasGroup>()).alpha = alpha;
-
-            if (style.Setters.TryGetValue("textAlign", out var ta))
-            {
-                var txt = go.GetComponentInChildren<Text>();
-                if (txt != null)
-                    txt.alignment = ta switch
-                    {
-                        "left" => TextAnchor.MiddleLeft, "center" => TextAnchor.MiddleCenter,
-                        "right" => TextAnchor.MiddleRight, _ => txt.alignment
-                    };
-            }
-
-            if (style.Setters.TryGetValue("whiteSpace", out var ws) && ws == "nowrap")
-            {
-                var txt = go.GetComponentInChildren<Text>();
-                if (txt != null) txt.horizontalOverflow = HorizontalWrapMode.Overflow;
-            }
-
-            if (style.Setters.TryGetValue("overflow", out var ov) && ov == "hidden")
-            {
-                if (go.GetComponent<Mask>() == null)
-                {
-                    var maskImg = go.GetComponent<Image>() ?? go.AddComponent<Image>();
-                    maskImg.color = Color.white;
-                    maskImg.raycastTarget = false;
-                    go.AddComponent<Mask>().showMaskGraphic = false;
-                }
-            }
-
-            var rect = go.GetComponent<RectTransform>();
-            if (rect == null) return;
-
-            if (style.Setters.TryGetValue("position", out var pos) && pos == "absolute")
-            {
-                (go.GetComponent<LayoutElement>() ?? go.AddComponent<LayoutElement>()).ignoreLayout = true;
-                float? t = null, r = null, b = null, l = null;
-                if (TryStyleFloat(style, "top", out var tv)) t = tv;
-                if (TryStyleFloat(style, "right", out var rv)) r = rv;
-                if (TryStyleFloat(style, "bottom", out var bv)) b = bv;
-                if (TryStyleFloat(style, "left", out var lv)) l = lv;
-                float lo = l ?? 0, ro = r ?? 0, to = t ?? 0, bo = b ?? 0;
-                rect.anchorMin = new Vector2(l.HasValue ? 0 : r.HasValue ? 1 : rect.anchorMin.x, b.HasValue ? 0 : t.HasValue ? 1 : rect.anchorMin.y);
-                rect.anchorMax = new Vector2(r.HasValue ? 1 : l.HasValue ? 0 : rect.anchorMax.x, t.HasValue ? 1 : b.HasValue ? 0 : rect.anchorMax.y);
-                rect.offsetMin = new Vector2(lo, bo); rect.offsetMax = new Vector2(-ro, -to);
-                return;
-            }
-
-            if (style.Setters.TryGetValue("anchor", out var anchor))
-            {
-                (go.GetComponent<LayoutElement>() ?? go.AddComponent<LayoutElement>()).ignoreLayout = true;
-                switch (anchor.ToLowerInvariant())
-                {
-                    case "topleft":      SetAnchor(rect, 0, 1, 0, 1, 0, 1); break;
-                    case "topcenter":    SetAnchor(rect, 0.5f, 1, 0.5f, 1, 0.5f, 1); break;
-                    case "topright":     SetAnchor(rect, 1, 1, 1, 1, 1, 1); break;
-                    case "centerleft":   SetAnchor(rect, 0, 0.5f, 0, 0.5f, 0, 0.5f); break;
-                    case "center":       SetAnchor(rect, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f); break;
-                    case "centerright":  SetAnchor(rect, 1, 0.5f, 1, 0.5f, 1, 0.5f); break;
-                    case "bottomleft":   SetAnchor(rect, 0, 0, 0, 0, 0, 0); break;
-                    case "bottomcenter": SetAnchor(rect, 0.5f, 0, 0.5f, 0, 0.5f, 0); break;
-                    case "bottomright":  SetAnchor(rect, 1, 0, 1, 0, 1, 0); break;
-                    case "stretch":      SetAnchor(rect, 0, 0, 1, 1, 0.5f, 0.5f); break;
-                }
-                if (TryStyleFloat(style, "x", out var px)) rect.anchoredPosition = new Vector2(px, rect.anchoredPosition.y);
-                if (TryStyleFloat(style, "y", out var py)) rect.anchoredPosition = new Vector2(rect.anchoredPosition.x, py);
-            }
-        }
-
-        private static void SetAnchor(RectTransform rt, float minX, float minY, float maxX, float maxY, float pivotX, float pivotY)
-        {
-            rt.anchorMin = new Vector2(minX, minY);
-            rt.anchorMax = new Vector2(maxX, maxY);
-            rt.pivot = new Vector2(pivotX, pivotY);
-            rt.anchoredPosition = Vector2.zero;
-            rt.sizeDelta = Vector2.zero;
-        }
-
-        private void BuildSlotImage(ImlElement element, Transform container)
-        {
-            var go = new GameObject("SlotImage");
-            var img = go.AddComponent<Image>();
-            img.raycastTarget = false;
-            var rect = go.GetComponent<RectTransform>();
-            rect.anchorMin = Vector2.zero;
-            rect.anchorMax = Vector2.one;
-            rect.sizeDelta = Vector2.zero;
-            rect.anchoredPosition = Vector2.zero;
-            go.AddComponent<LayoutElement>().ignoreLayout = true;
-            var slotStyle = GetEffectiveStyle(element);
-            if (TryParseColor(slotStyle, out var c)) img.color = c;
-            var source = element.GetString("source");
-            if (!string.IsNullOrEmpty(source))
-            {
-                var tex = LoadTexture(source);
-                if (tex != null)
-                {
-                    var raw = go.AddComponent<RawImage>();
-                    raw.texture = tex; raw.color = img.color;
-                    UnityEngine.Object.Destroy(img);
-                }
-            }
-            if (TryStyleFloat(slotStyle, "opacity", out var opacity))
-                (go.GetComponent<CanvasGroup>() ?? go.AddComponent<CanvasGroup>()).alpha = opacity;
-            ApplyCommonStyle(go, element);
-            go.transform.SetParent(container, false);
-            go.transform.SetAsFirstSibling();
-        }
-
-        private void ApplyContainerPadding(ImlElement element, ImlStyle style, HorizontalOrVerticalLayoutGroup lg, string key)
-        {
-            string val = null;
-            style?.Setters?.TryGetValue(key, out val);
-            if (string.IsNullOrEmpty(val)) return;
-            var p = val.Split(',');
-            int top, right, bottom, left;
-            if (p.Length == 1 && int.TryParse(p[0], out var all)) top = right = bottom = left = all;
-            else if (p.Length == 2 && int.TryParse(p[0], out var vert) && int.TryParse(p[1], out var horz))
-            { top = bottom = vert; left = right = horz; }
-            else if (p.Length == 4 && int.TryParse(p[0], out top) && int.TryParse(p[1], out right) && int.TryParse(p[2], out bottom) && int.TryParse(p[3], out left)) { }
-            else return;
-            lg.padding = new RectOffset(left, right, top, bottom);
-        }
-
-        private void ApplyFlexAlignment(ImlStyle style, HorizontalOrVerticalLayoutGroup lg, bool isHorizontal)
-        {
-            string justify = null, align = null;
-            if (style?.Setters != null)
-            { style.Setters.TryGetValue("justifyContent", out justify); style.Setters.TryGetValue("alignItems", out align); }
-            if (string.IsNullOrEmpty(justify) && string.IsNullOrEmpty(align)) return;
-            var (vAlign, hAlign) = isHorizontal ? (align ?? "stretch", justify ?? "start") : (justify ?? "start", align ?? "stretch");
-            TextAnchor anchor = TextAnchor.UpperCenter;
-            if (vAlign == "end") anchor = hAlign == "end" ? TextAnchor.LowerRight : hAlign == "center" ? TextAnchor.LowerCenter : TextAnchor.LowerLeft;
-            else if (vAlign == "center") anchor = hAlign == "end" ? TextAnchor.MiddleRight : hAlign == "center" ? TextAnchor.MiddleCenter : TextAnchor.MiddleLeft;
-            else anchor = hAlign == "end" ? TextAnchor.UpperRight : hAlign == "center" ? TextAnchor.UpperCenter : TextAnchor.UpperLeft;
-            lg.childAlignment = anchor;
-            if (align == "stretch" || string.IsNullOrEmpty(align))
-            { if (isHorizontal) lg.childForceExpandHeight = true; else lg.childForceExpandWidth = true; }
-        }
-
-        private static LayoutElement GetOrAddLayoutElement(GameObject go)
-            => go.GetComponent<LayoutElement>() ?? go.AddComponent<LayoutElement>();
-
-        private static bool TryStyleFloat(ImlStyle style, string key, out float value)
-        {
-            value = 0;
-            return style?.Setters != null && style.Setters.TryGetValue(key, out var s) && float.TryParse(s, out value);
-        }
-
-        private Texture2D LoadTexture(string path)
-        {
-            if (string.IsNullOrEmpty(path)) return null;
-            if (_textureCache.TryGetValue(path, out var cached)) return cached;
-            try
-            {
-                var fullPath = _parser.ResolvePath(path);
-                if (File.Exists(fullPath))
-                {
-                    var tex = new Texture2D(1, 1);
-                    tex.LoadImage(File.ReadAllBytes(fullPath));
-                    _textureCache[path] = tex;
-                    return tex;
-                }
-            }
-            catch { }
-            return null;
+            if (Target != null && Normal != null) Target.sprite = Normal;
         }
     }
 }

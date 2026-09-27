@@ -529,9 +529,9 @@ namespace Iris.Iml
     }
 
     /// <summary>
-    /// A CSS-like selector parsed from <c>on="Button.primary#id"</c>.
+    /// A CSS-like selector parsed from <c>on="Button.primary#id:hover"</c>.
     /// All non-null fields must match for the style to apply.
-    /// Specificity: Tag=1, Class=2, Id=3 (summed).
+    /// Specificity: Tag=1, Class=2, Id=3, Pseudo=2 (summed).
     /// </summary>
     public class StyleSelector
     {
@@ -539,13 +539,23 @@ namespace Iris.Iml
         public string Class { get; set; }
         public string Id { get; set; }
 
+        /// <summary>Pseudo classes (<c>:hover</c>, <c>:active</c>, <c>:disabled</c>, <c>:checked</c>).</summary>
+        public ImlStateFlags Pseudo { get; set; }
+
         public int Specificity =>
             (Tag  != null ? 1 : 0) +
             (Class != null ? 2 : 0) +
-            (Id   != null ? 3 : 0);
+            (Id   != null ? 3 : 0) +
+            (Pseudo != ImlStateFlags.None ? 2 : 0);
 
         public bool Matches(string elementTag, string elementClass, string elementId)
+            => Matches(elementTag, elementClass, elementId, ImlStateFlags.None);
+
+        public bool Matches(string elementTag, string elementClass, string elementId, ImlStateFlags state)
         {
+            // Every pseudo class required by the selector must be active.
+            if ((Pseudo & ~state) != 0)
+                return false;
             if (Tag != null && !string.Equals(Tag, elementTag, StringComparison.OrdinalIgnoreCase))
                 return false;
             if (Class != null)
@@ -578,26 +588,48 @@ namespace Iris.Iml
 
             var sel = new StyleSelector();
 
+            // Split off pseudo classes: "Button.primary:hover" → base "Button.primary", pseudo ":hover"
+            var baseSel = on;
+            var colon = on.IndexOf(':');
+            if (colon >= 0)
+            {
+                baseSel = on.Substring(0, colon);
+                foreach (var p in on.Substring(colon + 1).Split(':'))
+                {
+                    switch (p.Trim().ToLowerInvariant())
+                    {
+                        case "hover": sel.Pseudo |= ImlStateFlags.Hover; break;
+                        case "active":
+                        case "pressed": sel.Pseudo |= ImlStateFlags.Press; break;
+                        case "disabled": sel.Pseudo |= ImlStateFlags.Disabled; break;
+                        case "checked": sel.Pseudo |= ImlStateFlags.Checked; break;
+                        // unknown pseudo (e.g. ":focus", ":not(...)") → ignored, never matches
+                        case "": break;
+                        default: sel.Pseudo |= (ImlStateFlags)(1 << 30); break;
+                    }
+                }
+            }
+
             // Parse "Button.primary#myId"
             var i = 0;
             var segStart = 0;
-            while (i <= on.Length)
+            while (i <= baseSel.Length)
             {
-                if (i == on.Length || on[i] == '.' || on[i] == '#')
+                if (i == baseSel.Length || baseSel[i] == '.' || baseSel[i] == '#')
                 {
-                    var seg = on.Substring(segStart, i - segStart);
+                    var seg = baseSel.Substring(segStart, i - segStart);
                     if (!string.IsNullOrEmpty(seg))
                     {
                         // Determine what came before this segment
                         if (segStart == 0)
                         {
                             // First segment with no prefix: could be tag or class
-                            if (on[0] == '.') sel.Class = seg;
-                            else if (on[0] == '#') sel.Id = seg;
+                            if (baseSel[0] == '.') sel.Class = seg;
+                            else if (baseSel[0] == '#') sel.Id = seg;
                             else sel.Tag = seg; // no prefix → tag
                         }
-                        else if (on[segStart - 1] == '.') sel.Class = seg;
-                        else if (on[segStart - 1] == '#') sel.Id = seg;
+                        else if (baseSel[segStart - 1] == '.') sel.Class = seg;
+                        else if (baseSel[segStart - 1] == '#') sel.Id = seg;
                     }
                     segStart = i + 1;
                 }
