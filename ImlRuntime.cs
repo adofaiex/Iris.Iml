@@ -951,15 +951,26 @@ namespace Iris.Iml
                 foreach (var kv in elementStyle.Setters)
                     s.Setters[kv.Key] = kv.Value;
 
-            var selectedBg = StyleValues.GetStr(s, "selectedBg", "#D973A5");
-            var selectedColor = StyleValues.GetStr(s, "selectedColor", "#FFFFFF");
-            var unselectedBg = StyleValues.GetStr(s, "background", "#313338");
-            var unselectedColor = StyleValues.GetStr(s, "color", "#E9ECEF");
-            var radius = StyleValues.GetStr(s, "radius", "8");
+            // Baked selected/unselected look. Values come from the document's
+            // Selector styles (Theme.iml); only override what is actually set so
+            // the engine stays theme-free.
+            var selectedBg = StyleValues.GetStr(s, "selectedBg", "");
+            var selectedColor = StyleValues.GetStr(s, "selectedColor", "");
+            var unselectedBg = StyleValues.GetStr(s, "background", "");
+            var unselectedColor = StyleValues.GetStr(s, "color", "");
+            var radius = StyleValues.GetStr(s, "radius", "");
 
-            s.Setters["background"] = selected ? selectedBg : unselectedBg;
-            s.Setters["color"] = selected ? selectedColor : unselectedColor;
-            s.Setters["radius"] = radius;
+            if (selected)
+            {
+                if (!string.IsNullOrEmpty(selectedBg)) s.Setters["background"] = selectedBg;
+                if (!string.IsNullOrEmpty(selectedColor)) s.Setters["color"] = selectedColor;
+            }
+            else
+            {
+                if (!string.IsNullOrEmpty(unselectedBg)) s.Setters["background"] = unselectedBg;
+                if (!string.IsNullOrEmpty(unselectedColor)) s.Setters["color"] = unselectedColor;
+            }
+            if (!string.IsNullOrEmpty(radius)) s.Setters["radius"] = radius;
             return s;
         }
     }

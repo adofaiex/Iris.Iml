@@ -25,7 +25,6 @@ namespace Iris.Iml
         private readonly List<ImlStyle> _selectors = new();
         private readonly Dictionary<string, string> _variables = new();
         private int _orderCounter;
-        private bool _defaultsInstalled;
 
         private static readonly string[] InheritableKeys =
         {
@@ -69,8 +68,6 @@ namespace Iris.Iml
             _selectors.Clear();
             _variables.Clear();
             _orderCounter = 0;
-            _defaultsInstalled = false;
-            InstallDefaults();
         }
 
         public StyleEngine() => Reset();
@@ -286,132 +283,5 @@ namespace Iris.Iml
             }
         }
 
-        // ── built-in defaults ──────────────────────────────────────────────
-
-        /// <summary>
-        /// Built-in styles so a document only has to declare what differs.
-        /// Document styles with the same name/selector override these.
-        /// </summary>
-        private void InstallDefaults()
-        {
-            _defaultsInstalled = true;
-
-            // Semantic named styles — also registered as class selectors so both
-            // style="title" and class="title" work (matches existing .iml usage).
-            AddDefaultNamedAndSelector("title", new Dictionary<string, string>
-            {
-                ["fontSize"] = "20", ["color"] = "#F8F9FA", ["fontWeight"] = "bold",
-            });
-            AddDefaultNamedAndSelector("subtitle", new Dictionary<string, string>
-            {
-                ["fontSize"] = "15", ["color"] = "#F1F3F5",
-            });
-            AddDefaultNamedAndSelector("label", new Dictionary<string, string>
-            {
-                ["fontSize"] = "13",
-            });
-            AddDefaultNamedAndSelector("hint", new Dictionary<string, string>
-            {
-                ["fontSize"] = "12", ["color"] = "#7D7E7F",
-            });
-            AddDefaultNamedAndSelector("secondary", new Dictionary<string, string>
-            {
-                ["fontSize"] = "12", ["color"] = "#7D7E7F",
-            });
-            AddDefaultNamedAndSelector("normal", new Dictionary<string, string>
-            {
-                ["fontSize"] = "13", ["color"] = "#E9ECEF",
-            });
-            AddDefaultNamedAndSelector("text-secondary", new Dictionary<string, string>
-            {
-                ["fontSize"] = "12", ["color"] = "#7D7E7F",
-            });
-            AddDefaultNamedAndSelector("primary", new Dictionary<string, string>
-            {
-                ["background"] = "#D973A5", ["color"] = "#FFFFFF", ["radius"] = "8",
-            });
-            AddDefaultNamedAndSelector("element", new Dictionary<string, string>
-            {
-                ["background"] = "#313338", ["color"] = "#E9ECEF", ["radius"] = "8",
-            });
-            AddDefaultNamedAndSelector("padding", new Dictionary<string, string>
-            {
-                ["padding"] = "10",
-            });
-            AddDefaultNamedAndSelector("background", new Dictionary<string, string>
-            {
-                ["background"] = "#0D0E0F",
-            });
-
-            // Tag-level defaults (specificity 1 — any class/name beats these).
-            AddDefaultSelector("Text", new Dictionary<string, string>
-            {
-                ["color"] = "#E9ECEF",
-            });
-            AddDefaultSelector("Link", new Dictionary<string, string>
-            {
-                ["color"] = "#D973A5",
-            });
-            AddDefaultSelector("Button", new Dictionary<string, string>
-            {
-                ["background"] = "#313338", ["color"] = "#E9ECEF", ["radius"] = "8",
-                ["padding"] = "6,10",   // vertical, horizontal (CSS shorthand order)
-            });
-            AddDefaultSelector("TextField", new Dictionary<string, string>
-            {
-                ["background"] = "#151719", ["borderColor"] = "#222326",
-                ["borderWidth"] = "1", ["radius"] = "8", ["color"] = "#E9ECEF",
-            });
-            AddDefaultSelector("TextArea", new Dictionary<string, string>
-            {
-                ["background"] = "#151719", ["borderColor"] = "#222326",
-                ["borderWidth"] = "1", ["radius"] = "8", ["color"] = "#E9ECEF",
-            });
-            AddDefaultSelector("Separator", new Dictionary<string, string>
-            {
-                ["background"] = "#20FFFFFF",
-            });
-            AddDefaultSelector("Switch", new Dictionary<string, string>
-            {
-                ["switchOn"] = "#D973A5", ["switchOff"] = "#313338", ["knobColor"] = "#FFFFFF",
-            });
-            AddDefaultSelector("Checkbox", new Dictionary<string, string>
-            {
-                ["background"] = "#313338", ["borderColor"] = "#494F5C",
-                ["checkColor"] = "#FFFFFF", ["checkBg"] = "#D973A5",
-            });
-            AddDefaultSelector("Slider", new Dictionary<string, string>
-            {
-                ["sliderTrack"] = "#313338", ["sliderFill"] = "#D973A5",
-                ["sliderThumb"] = "#FFFFFF",
-            });
-            AddDefaultSelector("Icon", new Dictionary<string, string>
-            {
-                ["background"] = "#494F5C", ["borderColor"] = "#313338", ["color"] = "#FFFFFF",
-            });
-            AddDefaultSelector("ArrowButton", new Dictionary<string, string>
-            {
-                ["background"] = "#313338", ["borderColor"] = "#494F5C", ["color"] = "#FFFFFF",
-            });
-        }
-
-        private void AddDefaultNamedAndSelector(string name, Dictionary<string, string> setters)
-        {
-            AddStyle(new ImlStyle { Name = name, Setters = new Dictionary<string, string>(setters) });
-            AddStyle(new ImlStyle
-            {
-                Selector = StyleSelector.Parse("." + name),
-                Setters = new Dictionary<string, string>(setters),
-            });
-        }
-
-        private void AddDefaultSelector(string selector, Dictionary<string, string> setters)
-        {
-            AddStyle(new ImlStyle
-            {
-                Selector = StyleSelector.Parse(selector),
-                Setters = new Dictionary<string, string>(setters),
-            });
-        }
     }
 }

@@ -416,8 +416,6 @@ namespace Iris.Iml
             var knobTex = GuiTextureFactory.GetCircle(Mathf.RoundToInt(d), knob);
             GUI.DrawTexture(new Rect(kx, r.y + 2f, d, d), knobTex);
 
-            DrawHoverOverlay(r, radius, state);
-
             if (GUI.Button(r, GUIContent.none, GUIStyle.none))
                 Toggle(node);
         }
@@ -441,8 +439,6 @@ namespace Iris.Iml
                 var chk = GuiTextureFactory.GetCheckmark(Mathf.RoundToInt(r.width), check);
                 GUI.DrawTexture(r, chk);
             }
-
-            DrawHoverOverlay(r, radius, state);
 
             if (GUI.Button(r, GUIContent.none, GUIStyle.none))
                 Toggle(node);
@@ -542,10 +538,6 @@ namespace Iris.Iml
             GUI.DrawTexture(thumbRect,
                 GuiTextureFactory.GetCircle(Mathf.RoundToInt(thumbD), thumbC));
 
-            if ((state & ImlStateFlags.Hover) != 0 || GUIUtility.hotControl == id)
-                DrawHoverOverlay(new Rect(hitRect.x, r.y, hitRect.width, r.height),
-                    Mathf.RoundToInt(r.height / 2f), state);
-
             // apply changes
             if (!Mathf.Approximately(value, node.FloatValue))
             {
@@ -626,7 +618,6 @@ namespace Iris.Iml
 
             if (HasEvents(node.Element))
             {
-                DrawHoverOverlay(r, sz / 2, state);
                 if (GUI.Button(r, GUIContent.none, GUIStyle.none))
                     _rt.HandleElementEvents(node.Element);
             }
@@ -659,8 +650,6 @@ namespace Iris.Iml
                 };
                 gs.normal.background = gs.hover.background = gs.active.background = composed;
                 clicked = GUI.Button(r, GUIContent.none, gs);
-                if ((state & ImlStateFlags.Hover) != 0)
-                    DrawHoverOverlay(r, radius, state);
             }
             else
             {
@@ -673,10 +662,8 @@ namespace Iris.Iml
 
         private void DrawLink(ImlNode node, Rect r, ImlStyle style, ImlStateFlags state)
         {
-            bool hover = (state & ImlStateFlags.Hover) != 0;
-            Color color = hover
-                ? Color.white
-                : StyleValues.GetColor(style, "color", Hex("#D973A5"));
+            // hover/press colors come from :hover/:active styles (state-resolved upstream)
+            Color color = StyleValues.GetColor(style, "color", Hex("#D973A5"));
             color.a *= StyleValues.GetFloat(style, "opacity", 1f);
 
             var gs = GetLinkStyle(style, color);
@@ -747,13 +734,6 @@ namespace Iris.Iml
             GUI.color = c;
             GUI.DrawTexture(r, Texture2D.whiteTexture);
             GUI.color = prev;
-        }
-
-        private void DrawHoverOverlay(Rect r, int radius, ImlStateFlags state)
-        {
-            if ((state & ImlStateFlags.Hover) == 0) return;
-            float a = (state & ImlStateFlags.Press) != 0 ? 0.14f : 0.07f;
-            DrawShape(r, radius, new Color(1f, 1f, 1f, a), null, 0);
         }
 
         /// <summary>Draw a rounded rect via a 9-sliced GUI style (no corner
@@ -876,11 +856,9 @@ namespace Iris.Iml
             if (radius > 0)
             {
                 int size = Mathf.Max(radius * 2 + 8, 16);
-                gs.normal.background = GuiTextureFactory.GetRoundedRect(size, size, radius, bg, border, bwI);
-                gs.hover.background = GuiTextureFactory.GetRoundedRect(size, size, radius,
-                    StyleValues.Multiply(bg, 1.35f), border, bwI);
-                gs.active.background = GuiTextureFactory.GetRoundedRect(size, size, radius,
-                    StyleValues.Multiply(bg, 0.7f), border, bwI);
+                var tex = GuiTextureFactory.GetRoundedRect(size, size, radius, bg, border, bwI);
+                // hover/press visuals come from :hover/:active styles, not baked textures
+                gs.normal.background = gs.hover.background = gs.active.background = tex;
                 gs.border = new RectOffset(radius, radius, radius, radius);
             }
             gs.focused.background = gs.hover.background;

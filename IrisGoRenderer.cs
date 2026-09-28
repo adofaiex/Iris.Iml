@@ -448,13 +448,6 @@ namespace Iris.Iml
                     Mathf.RoundToInt(LayoutEngine.CheckboxSize), Color.white), 0);
             }
 
-            refs.Overlay = new GameObject("Overlay", typeof(RectTransform)).AddComponent<Image>();
-            var ovRT = (RectTransform)refs.Overlay.transform;
-            ovRT.SetParent(rt, false);
-            StretchFull(ovRT);
-            refs.Overlay.raycastTarget = false;
-            refs.Overlay.color = Color.clear;
-
             _interactive[rt.gameObject] = node;
             ApplyVisual(node, refs, node.Style, node.BuildState);
         }
@@ -712,15 +705,6 @@ namespace Iris.Iml
             StretchFull(symRT);
             refs.Symbol.raycastTarget = false;
 
-            refs.Overlay = new GameObject("Overlay", typeof(RectTransform)).AddComponent<Image>();
-            var ovRT = (RectTransform)refs.Overlay.transform;
-            ovRT.SetParent(rt, false);
-            StretchFull(ovRT);
-            refs.Overlay.raycastTarget = false;
-            refs.Overlay.sprite = GetRoundedSprite(sz / 2);
-            refs.Overlay.type = Image.Type.Sliced;
-            refs.Overlay.color = Color.clear;
-
             if (HasEvents(node.Element))
             {
                 var captured = node;
@@ -809,7 +793,6 @@ namespace Iris.Iml
             public Text Label;         // text / button label / input text
             public Image Symbol;       // icon symbol / arrow / checkmark / slider handle
             public Image Knob;         // switch knob
-            public Image Overlay;      // hover/press tint overlay
             public RectTransform Track; // slider track
             public Image Fill;          // slider fill
             public float TrackW;
@@ -839,8 +822,6 @@ namespace Iris.Iml
 
         private void ApplyVisual(ImlNode node, UiRefs refs, ImlStyle style, ImlStateFlags state)
         {
-            bool hover = (state & ImlStateFlags.Hover) != 0;
-            bool press = (state & ImlStateFlags.Press) != 0;
             float opacity = StyleValues.GetFloat(style, "opacity", 1f);
             if (opacity <= 0f && refs.Root != null && node.Kind != ImlNodeKind.ScrollView)
             {
@@ -854,14 +835,14 @@ namespace Iris.Iml
             {
                 case ImlNodeKind.Box:
                 case ImlNodeKind.Root:
-                    if (refs.Background != null) ApplyBoxImage(refs.Background, style, opacity, 1f);
+                    if (refs.Background != null) ApplyBoxImage(refs.Background, style, opacity);
                     break;
 
                 case ImlNodeKind.ScrollView:
                     if (refs.Background != null)
                     {
                         if (node.Style.Setters.ContainsKey("background"))
-                            ApplyBoxImage(refs.Background, style, opacity, 1f);
+                            ApplyBoxImage(refs.Background, style, opacity);
                     }
                     break;
 
@@ -871,8 +852,8 @@ namespace Iris.Iml
 
                 case ImlNodeKind.Link:
                 {
+                    // hover/press colors come from :hover/:active styles (state-resolved upstream)
                     var color = StyleValues.GetColor(style, "color", ParseHex("#D973A5"));
-                    if (hover) color = Color.white;
                     color.a *= opacity;
                     if (refs.Label != null) refs.Label.color = color;
                     if (refs.Symbol != null) refs.Symbol.color = color;
@@ -882,7 +863,7 @@ namespace Iris.Iml
                 case ImlNodeKind.Button:
                 case ImlNodeKind.SelectorOption:
                     if (refs.Background != null)
-                        ApplyBoxImage(refs.Background, style, opacity, hover ? 1.35f : press ? 0.7f : 1f);
+                        ApplyBoxImage(refs.Background, style, opacity);
                     ApplyLabelStyle(refs.Label, style, opacity, center: true);
                     break;
 
@@ -891,7 +872,6 @@ namespace Iris.Iml
                     bool on = node.Checked;
                     var fill = StyleValues.GetColor(style, on ? "switchOn" : "switchOff",
                         on ? ParseHex("#D973A5") : ParseHex("#313338"));
-                    if (hover && !press) fill = Multiply(fill, 1.15f);
                     fill.a *= opacity;
                     if (refs.Background != null) refs.Background.color = fill;
                     if (refs.Knob != null)
@@ -903,8 +883,6 @@ namespace Iris.Iml
                         float x = on ? LayoutEngine.SwitchW - 2f - d / 2f : 2f + d / 2f;
                         ((RectTransform)refs.Knob.transform).anchoredPosition = new Vector2(x, 0f);
                     }
-                    if (refs.Overlay != null)
-                        refs.Overlay.color = new Color(1f, 1f, 1f, (hover ? 0.07f : 0f) + (press ? 0.08f : 0f));
                     break;
                 }
 
@@ -913,7 +891,6 @@ namespace Iris.Iml
                     bool on = node.Checked;
                     var bg = StyleValues.GetColor(style, on ? "checkBg" : "background",
                         on ? ParseHex("#D973A5") : ParseHex("#313338"));
-                    if (hover && !press) bg = Multiply(bg, 1.15f);
                     Color? border = null;
                     if (!on)
                     {
@@ -941,8 +918,6 @@ namespace Iris.Iml
                             Mathf.RoundToInt(LayoutEngine.CheckboxSize), check), 0);
                         refs.Symbol.gameObject.SetActive(on);
                     }
-                    if (refs.Overlay != null)
-                        refs.Overlay.color = new Color(1f, 1f, 1f, (hover ? 0.07f : 0f) + (press ? 0.08f : 0f));
                     break;
                 }
 
@@ -966,8 +941,6 @@ namespace Iris.Iml
                             Mathf.RoundToInt(node.Rect.width), MapIcon(node.IconType), sym), 0);
                         refs.Symbol.type = Image.Type.Simple;
                     }
-                    if (refs.Overlay != null)
-                        refs.Overlay.color = new Color(1f, 1f, 1f, (hover ? 0.07f : 0f) + (press ? 0.08f : 0f));
                     break;
                 }
 
@@ -975,7 +948,6 @@ namespace Iris.Iml
                 {
                     var dir = MapArrow(node.Direction);
                     var bg = StyleValues.GetColor(style, "background", ParseHex("#313338"));
-                    if (hover && !press) bg = Multiply(bg, 1.35f);
                     bg.a *= opacity;
                     var borderC = StyleValues.GetColor(style, "borderColor", ParseHex("#494F5C"));
                     borderC.a *= opacity;
@@ -1017,8 +989,6 @@ namespace Iris.Iml
                             Mathf.RoundToInt(node.Rect.width), dir, arrow), 0);
                         refs.Symbol.type = Image.Type.Simple;
                     }
-                    if (refs.Overlay != null)
-                        refs.Overlay.color = new Color(1f, 1f, 1f, (hover ? 0.07f : 0f) + (press ? 0.08f : 0f));
                     break;
                 }
 
@@ -1109,10 +1079,9 @@ namespace Iris.Iml
             }
         }
 
-        private void ApplyBoxImage(Image img, ImlStyle style, float opacity, float brightness)
+        private void ApplyBoxImage(Image img, ImlStyle style, float opacity)
         {
             var bg = StyleValues.GetColor(style, "background", Color.white);
-            if (brightness != 1f) bg = Multiply(bg, brightness);
             bg.a *= opacity;
             int radius = StyleValues.GetInt(style, "radius", 0);
             float bw = StyleValues.GetFloat(style, "borderWidth", 0f);
